@@ -5963,6 +5963,7 @@ void Interpreter::SpReset() {
 #ifdef PORT_DIAG_HAVE_ASAN
         if (_old != 0) {
             diagRecordSegWrite(i, _old, 0, "SpReset", 0);
+
         }
 #endif
     }
