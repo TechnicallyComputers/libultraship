@@ -769,6 +769,37 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
             tex.msaaTexture = mDevice->newTexture(tex_descriptor);
         }
 
+        // Metal does not zero-initialize newly allocated textures (unlike OpenGL).
+        // Subsequent passes use LoadActionLoad and the game's draws are clipped to
+        // its native viewport via scissor; pixels outside that scissor on the
+        // upscaled host target are never written. With MSAA enabled, the resolve
+        // propagates the unwritten MSAA samples into the resolve target every
+        // frame, so a fresh msaaTexture's uninitialized contents become a visible
+        // edge band around the rendered image. Clear all newly allocated render
+        // targets to opaque black up front so unscissored regions read predictably.
+        auto initRenderTargetToBlack = [this](MTL::Texture* texture) {
+            if (texture == nullptr) {
+                return;
+            }
+            if ((texture->usage() & MTL::TextureUsageRenderTarget) == 0) {
+                return;
+            }
+            MTL::RenderPassDescriptor* clear_pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+            clear_pass->colorAttachments()->object(0)->setTexture(texture);
+            clear_pass->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionClear);
+            clear_pass->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 1.0));
+            clear_pass->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
+            MTL::CommandBuffer* clear_cb = mCommandQueue->commandBuffer();
+            clear_cb->setLabel(NS::String::string("Clear new RT to black", NS::UTF8StringEncoding));
+            MTL::RenderCommandEncoder* clear_enc = clear_cb->renderCommandEncoder(clear_pass);
+            clear_enc->endEncoding();
+            clear_cb->commit();
+        };
+        initRenderTargetToBlack(tex.texture);
+        if (msaa_level > 1) {
+            initRenderTargetToBlack(tex.msaaTexture);
+        }
+
         if (render_target) {
             MTL::RenderPassDescriptor* render_pass_descriptor = MTL::RenderPassDescriptor::renderPassDescriptor();
 
@@ -1084,6 +1115,42 @@ void GfxRenderingAPIMetal::CopyFramebuffer(int fb_dst_id, int fb_src_id, int src
 
     int target_texture_id = mFramebuffers[fb_dst_id].mTextureId;
     MTL::Texture* target_texture = mTextures[target_texture_id].texture;
+
+    // Standalone path: when called between frames (e.g. SSB64 framebuffer-
+    // capture bridge from a game-thread task FuncStart), the source FB has
+    // no live mCommandBuffer/mCommandEncoder -- EndFrame nulls them. Fall
+    // back to a fresh, self-contained command buffer + blit encoder, modeled
+    // after ReadFramebufferToCPU below. The blit reads the prior frame's
+    // committed pixels (command queues are FIFO so this runs after any
+    // pending render commands targeting the source FB).
+    if (source_framebuffer.mCommandBuffer == nullptr) {
+        NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
+
+        MTL::CommandBuffer* cb = mCommandQueue->commandBuffer();
+        cb->setLabel(NS::String::string("Standalone Copy Framebuffer Command Buffer", NS::UTF8StringEncoding));
+
+        MTL::BlitCommandEncoder* blit_encoder = cb->blitCommandEncoder();
+        blit_encoder->setLabel(
+            NS::String::string("Standalone Copy Framebuffer Encoder", NS::UTF8StringEncoding));
+
+        MTL::Origin source_origin = MTL::Origin(srcX0, srcY0, 0);
+        MTL::Origin target_origin = MTL::Origin(dstX0, dstY0, 0);
+        MTL::Size source_size = MTL::Size(srcX1 - srcX0, srcY1 - srcY0, 1);
+
+        blit_encoder->copyFromTexture(source_texture, 0, 0, source_origin, source_size, target_texture, 0, 0,
+                                      target_origin);
+        blit_encoder->endEncoding();
+
+        cb->commit();
+        // Wait so the destination texture is ready to be sampled by any draw
+        // submitted in the same frame as the eventual SelectTextureFb call.
+        // The standalone path is rare (only at scene-transition boundaries
+        // like 1P stage clear or VS results) and the blit itself is cheap.
+        cb->waitUntilCompleted();
+
+        autorelease_pool->release();
+        return;
+    }
 
     // End the current render encoder
     source_framebuffer.mCommandEncoder->endEncoding();
