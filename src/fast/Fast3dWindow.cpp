@@ -196,17 +196,33 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     }
 
     auto gui = wnd->GetGui();
-    // Setup mouse state manager
     wnd->GetMouseStateManager()->StartFrame();
-    // Setup of the backend frames and draw initial Window and GUI menus
     gui->StartDraw();
-    // Setup game framebuffers to match available window space
     mInterpreter->StartFrame();
-    // Execute the games gfx commands
     mInterpreter->Run(commands, mtxReplacements);
-    // Renders the game frame buffer to the final window and finishes the GUI
     gui->EndDraw();
-    // Finalize swap buffers
+    mInterpreter->EndFrame();
+
+    return true;
+}
+
+bool Fast3dWindow::PresentCurrentFramebuffer() {
+    std::shared_ptr<Window> wnd = Ship::Context::GetInstance()->GetWindow();
+
+    if (wnd->GetGfxFrameBuffer() == 0) {
+        return false;
+    }
+
+    if (!wnd->IsFrameReady()) {
+        return false;
+    }
+
+    auto gui = wnd->GetGui();
+    wnd->GetMouseStateManager()->StartFrame();
+    gui->StartDraw();
+    mInterpreter->StartFrame();
+    mInterpreter->PresentCurrentFramebuffer();
+    gui->EndDraw();
     mInterpreter->EndFrame();
 
     return true;

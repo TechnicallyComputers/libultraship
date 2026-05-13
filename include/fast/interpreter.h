@@ -180,6 +180,8 @@ struct TextureCacheKey {
     uint8_t fmt, siz;
     uint8_t palette_index;
     uint32_t size_bytes;
+    uint8_t masks, maskt;
+    uint16_t tile_width, tile_height;
 
     bool operator==(const TextureCacheKey&) const noexcept = default;
 
@@ -286,6 +288,7 @@ struct RDP {
         uint8_t siz;
         uint8_t cms, cmt;
         uint8_t shifts, shiftt;
+        uint8_t masks, maskt; // PORT: wrap masks (N64 mask_s, mask_t) — 0 means no mask
         float uls, ult, lrs, lrt;
         uint16_t tmem; // 0-511, in 64-bit word units
         uint32_t line_size_bytes;
@@ -301,6 +304,14 @@ struct RDP {
     bool grayscale;
 
     uint8_t prim_lod_fraction;
+    // PORT: G_SETPRIMDEPTH stores a constant Z (and dz) used when other_mode_l has
+    // G_ZS_PRIM set. Upstream Fast3D never wired this up — game sprites rendered
+    // with gDPSetDepthSource(G_ZS_PRIM) ended up at vertex Z (typically near plane),
+    // so 2D backgrounds stomped 3D foreground geometry across the port (SSB64
+    // wallpaper occluding the explosion transition, fighter description-scene 2D
+    // logo drawing in front of the model, etc.).
+    uint16_t prim_depth_z;
+    uint16_t prim_depth_dz;
     struct RGBA env_color, prim_color, fog_color, blend_color, fill_color, grayscale_color;
     struct XYWidthHeight viewport, scissor;
     bool viewport_or_scissor_changed;
@@ -370,10 +381,12 @@ class Interpreter {
     void StartFrame();
     void RunGuiOnly();
     void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
+    void PresentCurrentFramebuffer();
     void EndFrame();
     void HandleWindowEvents();
     bool IsFrameReady();
     bool ViewportMatchesRendererResolution();
+    void SetForceRenderToFb(bool force);
     int GetTargetFps();
     void SetTargetFps(int fps);
     void SetMaxFrameLatency(int latency);
@@ -388,10 +401,53 @@ class Interpreter {
     void RegisterBlendedTexture(const char* name, uint8_t* mask, uint8_t* replacement);
     void UnregisterBlendedTexture(const char* name);
 
+    // Register a CPU address range as a mirror of a GPU framebuffer's sub-rect.
+    // When ImportTexture sees a gsDPSetTextureImage(cpuAddr) where cpuAddr falls
+    // inside [base, base+sizeBytes), it binds the registered FB via
+    // SelectTextureFb AND remaps the consumer's local UV (0..1) to the FB
+    // sub-rect [u0,u1] x [v0,v1] -- so a multi-tile sprite that samples its
+    // own 300x6 row-stripe at UV (0..1) ends up sampling a 300x6 slice of the
+    // bigger captured FB instead of the whole thing.
+    //
+    // u0/v0/u1/v1 are normalized [0,1] coordinates of the source FB.
+    // For a 1:1 substitution (single quad covering the whole FB) pass
+    // (0, 0, 1, 1).
+    //
+    // Used by the SSB64 framebuffer-capture trick (1P stage clear wallpaper
+    // = ~37 row-stripes, each registered with its slice of the photo region;
+    // lbtransition photo wipe -> VS results screen = single-tile photo heap).
+    // The UV-remap plumbing in GfxSpTri1 makes this work for any N64 game
+    // that samples a captured framebuffer via N>=1 tile loads (i.e. all of
+    // them, since N64 TMEM is 4 KB and any FB-sized region must be tiled).
+    void RegisterFbTexture(const void* base, size_t sizeBytes, int fbId,
+                           float u0, float v0, float u1, float v1);
+    void UnregisterFbTexture(const void* base);
+    void ClearFbTextures();
+
     void SetNativeDimensions(float width, float height);
     void SetResolutionMultiplier(float multiplier);
     void SetMsaaLevel(uint32_t level);
     void GetCurDimensions(uint32_t* width, uint32_t* height);
+
+    // Port hook: when set true, AdjXForAspectRatio compresses post-projection
+    // clip-space X by (4/3) / window_aspect, expanding the visible 4:3
+    // frustum into the wider window. Refreshed per-frame by the game's port
+    // glue from a CVar; default false means non-widescreen-aware ports get
+    // exactly the prior unconditional behaviour as a no-op fallback.
+    void SetWidescreenActive(bool active) { mWidescreenActive = active; }
+
+    // Returns the same scale factor AdjXForAspectRatio applies to clip-space X.
+    // Port glue uses this to compress game-side world-to-screen projection
+    // results so HUD sprites that attach to 3D characters track them after
+    // the camera frustum widens. Returns 1.0f when widescreen is off or when
+    // the window is not wider than 4:3.
+    float GetWidescreenClipXScale() const;
+
+    // Port hook: when set true AND widescreen is active, the GPU scissor is
+    // narrowed to the original 4:3 sub-region of the wider FB. Game code
+    // flips this on for scene-specific effects whose mesh geometry would
+    // otherwise expose perspective-foreshortened slants in widescreen.
+    void SetTight4_3ScissorWindow(bool active) { mTight4_3ScissorWindow = active; }
 
     // private: TODO make these private
     void Flush();
@@ -400,6 +456,8 @@ class Interpreter {
     void TextureCacheClear();
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
+    void TextureCacheDeleteRange(const uint8_t* base, size_t size);
+    void ResetRdpTextureState();
     void ImportTextureRgba16(int tile, bool importReplacement);
     void ImportTextureRgba32(int tile, bool importReplacement);
     void ImportTextureIA4(int tile, bool importReplacement);
@@ -506,6 +564,17 @@ class Interpreter {
 
     bool mFbActive{};
     bool mRendersToFb{}; // game_renders_to_framebuffer;
+    // When true, ViewportMatchesRendererResolution() always returns false,
+    // which pins mRendersToFb=true and keeps mGameFb populated every frame.
+    // Required by GPU-readback consumers (e.g. SSB64's stage-clear / scene-
+    // transition wallpaper capture) on backends where FB 0 is the swap-
+    // chain back buffer with undefined post-Present contents (D3D11 FLIP_-
+    // DISCARD on Windows). On macOS the same effect is achieved
+    // unconditionally via the __APPLE__ guard inside that method.
+    bool mForceRenderToFb{};
+    // SSB64 port widescreen toggle — see SetWidescreenActive() doc.
+    bool mWidescreenActive{};
+    bool mTight4_3ScissorWindow{};
     std::map<int, FBInfo>::iterator mActiveFrameBuffer;
     std::map<int, FBInfo> mFrameBuffers;
 
@@ -515,6 +584,27 @@ class Interpreter {
     std::set<std::pair<float, float>> mGetPixelDepthPending; // get_pixel_depth_pending;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> mGetPixelDepthCached; // get_pixel_depth_cached;
     std::map<std::string, MaskedTextureEntry, std::less<>> mMaskedTextures;
+    // base addr -> (end addr exclusive, GPU FB id, source-FB UV sub-rect).
+    // Ordered so range lookup can do an upper_bound + step-back walk.
+    // See RegisterFbTexture.
+    struct FbTextureRange {
+        uintptr_t end;
+        int fbId;
+        float u0, v0, u1, v1;
+    };
+    std::map<uintptr_t, FbTextureRange> mFbTextures;
+
+    // Per-tile-slot UV transform applied in GfxSpTri1 to remap a tile's local
+    // UV (0..1) into the registered FB's sub-rect [u0,u1] x [v0,v1].
+    // Identity (scale=1, offset=0) when the bound texture isn't an FB mirror,
+    // which is the common case. Set by ImportTexture's FB-mirror hook on hit
+    // and reset to identity on every miss so a previous hit's transform never
+    // leaks into a fresh non-FB binding.
+    struct FbUvTransform {
+        float scaleU, scaleV;
+        float offsetU, offsetV;
+    };
+    FbUvTransform mFbUvTransform[2] = { { 1.0f, 1.0f, 0.0f, 0.0f }, { 1.0f, 1.0f, 0.0f, 0.0f } };
 
     const std::unordered_map<Mtx*, MtxF>* mCurMtxReplacements;
     bool mMarkerOn; // This was originally a debug feature. Now it seems to control s2dex?
@@ -538,3 +628,9 @@ const char* GfxGetOpcodeName(int8_t opcode);
 extern "C" void gfx_texture_cache_clear();
 extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,
                                       uint8_t resize);
+
+/* GBI trace callback — called for every command during interpreter execution.
+ * Parameters: w0, w1 (raw command words), dl_depth (call stack depth).
+ * Set to NULL to disable. */
+typedef void (*GbiTraceCallbackFn)(uintptr_t w0, uintptr_t w1, int dl_depth);
+extern "C" void gfx_set_trace_callback(GbiTraceCallbackFn callback);

@@ -58,7 +58,7 @@ target_link_libraries(libultraship
     PUBLIC ImGui
 )
 
-target_link_libraries(libultraship PRIVATE stb)
+target_link_libraries(libultraship PUBLIC stb)
 
 if (GFX_DEBUG_DISASSEMBLER)
     target_link_libraries(libultraship PRIVATE libgfxd)
@@ -75,6 +75,9 @@ target_link_libraries(libultraship PUBLIC tinyxml2::tinyxml2)
 
 find_package(spdlog REQUIRED)
 target_link_libraries(libultraship PUBLIC spdlog::spdlog)
+
+# hidapi for native Raphnet N64 USB adapter (vendored via FetchContent in cmake/dependencies/common.cmake).
+target_link_libraries(libultraship PRIVATE hidapi::hidapi)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(THREADS_PREFER_PTHREAD_FLAG ON)

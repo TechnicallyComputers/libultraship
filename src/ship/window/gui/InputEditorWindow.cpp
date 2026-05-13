@@ -5,6 +5,7 @@
 #include "ship/config/ConsoleVariable.h"
 #include "ship/controller/controldevice/controller/mapping/sdl/SDLAxisDirectionToButtonMapping.h"
 #include "ship/controller/controldeck/ControlDeck.h"
+#include "ship/controller/raphnet/RaphnetPhysicalDeviceManager.h"
 #include "libultraship/libultra/controller.h"
 
 #define SCALE_IMGUI_SIZE(value) ((value / 13.0f) * ImGui::GetFontSize())
@@ -164,6 +165,9 @@ void InputEditorWindow::DrawAnalogPreview(const char* label, ImVec2 stick, float
 #define BUTTON_COLOR_GAMEPAD_PURPLE ImVec4(0.431f, 0.369f, 0.706f, 0.5f)
 #define BUTTON_COLOR_GAMEPAD_PURPLE_HOVERED ImVec4(0.431f, 0.369f, 0.706f, 1.0f)
 
+#define BUTTON_COLOR_GAMEPAD_TEAL ImVec4(0.0f, 0.55f, 0.55f, 0.5f)
+#define BUTTON_COLOR_GAMEPAD_TEAL_HOVERED ImVec4(0.0f, 0.55f, 0.55f, 1.0f)
+
 void InputEditorWindow::GetButtonColorsForPhysicalDeviceType(PhysicalDeviceType lusIndex, ImVec4& buttonColor,
                                                              ImVec4& buttonHoveredColor) {
     switch (lusIndex) {
@@ -178,6 +182,10 @@ void InputEditorWindow::GetButtonColorsForPhysicalDeviceType(PhysicalDeviceType 
         case PhysicalDeviceType::SDLGamepad:
             buttonColor = BUTTON_COLOR_GAMEPAD_BLUE;
             buttonHoveredColor = BUTTON_COLOR_GAMEPAD_BLUE_HOVERED;
+            break;
+        case PhysicalDeviceType::Raphnet:
+            buttonColor = BUTTON_COLOR_GAMEPAD_TEAL;
+            buttonHoveredColor = BUTTON_COLOR_GAMEPAD_TEAL_HOVERED;
             break;
         default:
             buttonColor = BUTTON_COLOR_GAMEPAD_PURPLE;
@@ -1235,6 +1243,37 @@ void InputEditorWindow::DrawClearAllButton(uint8_t portIndex) {
 
 void InputEditorWindow::DrawPortTab(uint8_t portIndex) {
     if (ImGui::BeginTabItem(StringHelper::Sprintf("Port %d###port%d", portIndex + 1, portIndex).c_str())) {
+        // Native Raphnet ports — buttons / sticks come from raw N64 SI status,
+        // not from the SDL/keyboard mapping pipeline. Rebinding is meaningless
+        // (the firmware reports exactly what the controller hardware sends),
+        // so we draw an explanatory banner and skip the per-binding chips.
+        auto raphnetManager =
+            Context::GetInstance()->GetControlDeck()->GetRaphnetPhysicalDeviceManager();
+        if (raphnetManager != nullptr && raphnetManager->IsPortClaimed(portIndex)) {
+            ImGui::PushStyleColor(ImGuiCol_Text, BUTTON_COLOR_GAMEPAD_TEAL_HOVERED);
+            ImGui::TextWrapped(
+                "Native Raphnet adapter (channel %d). Buttons and sticks are read directly from "
+                "the N64 controller via the adapter's vendor protocol; no rebinding available. "
+                "If polling is failing for your hardware, click \"Disable for this session\" to "
+                "fall back to SDL/keyboard for this port (no relaunch needed). To force-disable "
+                "native mode permanently, set CVAR gControllers.Raphnet.Enabled=0 and relaunch.",
+                raphnetManager->GetChannelForPort(portIndex));
+            ImGui::PopStyleColor();
+            if (ImGui::Button(StringHelper::Sprintf("Disable for this session##raphnetDisable%d", portIndex).c_str())) {
+                raphnetManager->ReleasePort(portIndex);
+                // The manager can't reach into LUS::Controller; clear the
+                // controller's own binding so its next ReadToOSContPad falls
+                // through to the SDL/keyboard mapping pipeline instead of
+                // continuing to call Poll on a still-alive transport.
+                auto ctrl = Context::GetInstance()->GetControlDeck()->GetControllerByPort(portIndex);
+                if (ctrl != nullptr) {
+                    ctrl->SetRaphnetBinding(std::weak_ptr<RaphnetTransport>(), 0);
+                }
+            }
+            ImGui::EndTabItem();
+            return;
+        }
+
         DrawClearAllButton(portIndex);
         DrawSetDefaultsButton(portIndex);
         DrawDeviceToggles(portIndex);
@@ -1264,18 +1303,24 @@ void InputEditorWindow::DrawPortTab(uint8_t portIndex) {
         }
 
         if (ImGui::CollapsingHeader("D-Pad", NULL, ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::PushID("DPad");
             DrawButtonLine(StringHelper::Sprintf("%s", ICON_FA_ARROW_UP).c_str(), portIndex, BTN_DUP);
             DrawButtonLine(StringHelper::Sprintf("%s", ICON_FA_ARROW_DOWN).c_str(), portIndex, BTN_DDOWN);
             DrawButtonLine(StringHelper::Sprintf("%s", ICON_FA_ARROW_LEFT).c_str(), portIndex, BTN_DLEFT);
             DrawButtonLine(StringHelper::Sprintf("%s", ICON_FA_ARROW_RIGHT).c_str(), portIndex, BTN_DRIGHT);
+            ImGui::PopID();
         }
 
         if (ImGui::CollapsingHeader("Analog Stick", NULL, ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::PushID("AnalogStick");
             DrawStickSection(portIndex, LEFT, 0);
+            ImGui::PopID();
         }
 
         if (ImGui::CollapsingHeader("Additional (\"Right\") Stick")) {
+            ImGui::PushID("RightStick");
             DrawStickSection(portIndex, RIGHT, 1, CHIP_COLOR_N64_YELLOW);
+            ImGui::PopID();
         }
 
         if (ImGui::CollapsingHeader("Rumble")) {

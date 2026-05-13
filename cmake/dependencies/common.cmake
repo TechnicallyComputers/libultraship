@@ -53,6 +53,21 @@ endif()
 #=================== STB ===================
 set(STB_DIR ${CMAKE_BINARY_DIR}/_deps/stb)
 file(DOWNLOAD "https://github.com/nothings/stb/raw/0bc88af4de5fb022db643c2d8e549a0927749354/stb_image.h" "${STB_DIR}/stb_image.h")
+# If network download failed (sandbox/proxy/offline), fall back to vendored copy used by Torch.
+if (EXISTS "${STB_DIR}/stb_image.h")
+    file(SIZE "${STB_DIR}/stb_image.h" STB_IMAGE_SIZE)
+else()
+    set(STB_IMAGE_SIZE 0)
+endif()
+if (STB_IMAGE_SIZE EQUAL 0)
+    set(STB_FALLBACK "${CMAKE_SOURCE_DIR}/torch/lib/n64graphics/stb_image.h")
+    if (EXISTS "${STB_FALLBACK}")
+        message(WARNING "stb_image.h download failed/empty; using fallback at ${STB_FALLBACK}")
+        file(COPY "${STB_FALLBACK}" DESTINATION "${STB_DIR}")
+    else()
+        message(FATAL_ERROR "stb_image.h download failed and fallback file is missing: ${STB_FALLBACK}")
+    endif()
+endif()
 file(WRITE "${STB_DIR}/stb_impl.c" "#define STB_IMAGE_IMPLEMENTATION\n#include \"stb_image.h\"")
 
 add_library(stb STATIC)
@@ -111,3 +126,31 @@ FetchContent_Declare(
     GIT_TAG 1de054450e7b3c5f777d2e3dfcb228ad120c329d
 )
 FetchContent_MakeAvailable(prism)
+
+#=========== hidapi (native Raphnet N64 USB adapter support) ===========
+# Static-only, hidraw backend on Linux (no libusb dep). 0.14.0 fixes a
+# macOS hid_close deadlock present in 0.13.x.
+set(HIDAPI_BUILD_HIDTEST OFF CACHE BOOL "" FORCE)
+set(HIDAPI_WITH_TESTS OFF CACHE BOOL "" FORCE)
+set(HIDAPI_INSTALL_TARGETS OFF CACHE BOOL "" FORCE)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
+    set(HIDAPI_WITH_HIDRAW ON CACHE BOOL "" FORCE)
+    set(HIDAPI_WITH_LIBUSB OFF CACHE BOOL "" FORCE)
+endif()
+# Force static while pulling hidapi in, then restore caller's preference.
+set(_LUS_BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
+set(BUILD_SHARED_LIBS OFF)
+# hidapi-0.14.0 declares cmake_minimum_required(3.4.3); CMake 4.x removed
+# < 3.5 compatibility, so allow it via policy minimum.
+set(_LUS_CMP_MIN_SAVED ${CMAKE_POLICY_VERSION_MINIMUM})
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+FetchContent_Declare(
+    hidapi
+    GIT_REPOSITORY https://github.com/libusb/hidapi.git
+    GIT_TAG hidapi-0.14.0
+)
+FetchContent_MakeAvailable(hidapi)
+set(CMAKE_POLICY_VERSION_MINIMUM ${_LUS_CMP_MIN_SAVED})
+unset(_LUS_CMP_MIN_SAVED)
+set(BUILD_SHARED_LIBS ${_LUS_BUILD_SHARED_LIBS_SAVED})
+unset(_LUS_BUILD_SHARED_LIBS_SAVED)

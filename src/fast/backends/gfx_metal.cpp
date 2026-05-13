@@ -191,6 +191,43 @@ void GfxRenderingAPIMetal::Init() {
     mConvertToRgb5a1Function = library->newFunction(NS::String::string("convertToRGB5A1", NS::UTF8StringEncoding));
 
     library->release();
+
+    // Allocate a 1x1 transparent-black RGBA texture for use as a fallback when a fragment
+    // shader sampler slot would otherwise default to mTextures[0] (the screen drawable).
+    // Without this, a CC mode that declares TEXEL1 but whose tile 1 was never loaded ends
+    // up sampling the screen color buffer mid-render — a visible feedback loop on Metal.
+    // OpenGL's GLD driver substitutes a zero texture in the same situation; this matches.
+    {
+        mFallbackTextureId = NewTexture();
+        TextureDataMetal& fallback = mTextures[mFallbackTextureId];
+
+        MTL::TextureDescriptor* desc =
+            MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, 1, 1, false);
+        desc->setStorageMode(MTL::StorageModeShared);
+        fallback.texture = mDevice->newTexture(desc);
+        fallback.width = 1;
+        fallback.height = 1;
+        const uint8_t zero_pixel[4] = { 0, 0, 0, 0 };
+        fallback.texture->replaceRegion(MTL::Region::Make2D(0, 0, 1, 1), 0, zero_pixel, 4);
+
+        MTL::SamplerDescriptor* sd = MTL::SamplerDescriptor::alloc()->init();
+        sd->setMinFilter(MTL::SamplerMinMagFilterNearest);
+        sd->setMagFilter(MTL::SamplerMinMagFilterNearest);
+        sd->setSAddressMode(MTL::SamplerAddressModeClampToEdge);
+        sd->setTAddressMode(MTL::SamplerAddressModeClampToEdge);
+        sd->setRAddressMode(MTL::SamplerAddressModeClampToEdge);
+        fallback.sampler = mDevice->newSamplerState(sd);
+        fallback.filtering = FILTER_LINEAR;
+        fallback.linear_filtering = false;
+        sd->release();
+
+        // Point every sampler slot at the fallback by default. Real ImportTexture calls
+        // overwrite per-slot indices as they happen.
+        for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
+            mCurrentTextureIds[i] = mFallbackTextureId;
+        }
+    }
+
     autorelease_pool->release();
 }
 
@@ -481,20 +518,30 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
 
     for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
         if (mShaderProgram->usedTextures[i]) {
-            if (current_framebuffer.mLastBoundTextures[i] != mTextures[mCurrentTextureIds[i]].texture) {
-                current_framebuffer.mLastBoundTextures[i] = mTextures[mCurrentTextureIds[i]].texture;
-                current_framebuffer.mCommandEncoder->setFragmentTexture(mTextures[mCurrentTextureIds[i]].texture, i);
+            uint32_t tid = mCurrentTextureIds[i];
+            MTL::Texture* tex = mTextures[tid].texture;
+            MTL::SamplerState* smp = mTextures[tid].sampler;
+            // Backstop: if the binding for a slot the shader actually uses would alias the
+            // screen drawable (mTextures[0]) or has no MTL::Texture/sampler yet, redirect
+            // to the 1x1 black fallback so the shader samples zeros instead of the live
+            // color buffer it is rendering into.
+            if (tid == 0 || tex == nullptr || smp == nullptr) {
+                tid = mFallbackTextureId;
+                tex = mTextures[tid].texture;
+                smp = mTextures[tid].sampler;
+            }
 
-                if (current_framebuffer.mLastBoundSamplers[i] != mTextures[mCurrentTextureIds[i]].sampler) {
-                    current_framebuffer.mLastBoundSamplers[i] = mTextures[mCurrentTextureIds[i]].sampler;
-                    current_framebuffer.mCommandEncoder->setFragmentSamplerState(
-                        mTextures[mCurrentTextureIds[i]].sampler, i);
-                }
+            if (current_framebuffer.mLastBoundTextures[i] != tex) {
+                current_framebuffer.mLastBoundTextures[i] = tex;
+                current_framebuffer.mCommandEncoder->setFragmentTexture(tex, i);
+            }
+            if (current_framebuffer.mLastBoundSamplers[i] != smp) {
+                current_framebuffer.mLastBoundSamplers[i] = smp;
+                current_framebuffer.mCommandEncoder->setFragmentSamplerState(smp, i);
             }
         }
 
         if (mCurrentFilterMode == FILTER_THREE_POINT) {
-            mDrawUniforms.textureFiltering[i] = mTextures[mCurrentTextureIds[i]].filtering;
             mDrawUniforms.textureFiltering[i] = mTextures[mCurrentTextureIds[i]].filtering;
             textures_changed = true;
         }
@@ -720,6 +767,37 @@ void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width
             if (tex.msaaTexture != nullptr)
                 tex.msaaTexture->release();
             tex.msaaTexture = mDevice->newTexture(tex_descriptor);
+        }
+
+        // Metal does not zero-initialize newly allocated textures (unlike OpenGL).
+        // Subsequent passes use LoadActionLoad and the game's draws are clipped to
+        // its native viewport via scissor; pixels outside that scissor on the
+        // upscaled host target are never written. With MSAA enabled, the resolve
+        // propagates the unwritten MSAA samples into the resolve target every
+        // frame, so a fresh msaaTexture's uninitialized contents become a visible
+        // edge band around the rendered image. Clear all newly allocated render
+        // targets to opaque black up front so unscissored regions read predictably.
+        auto initRenderTargetToBlack = [this](MTL::Texture* texture) {
+            if (texture == nullptr) {
+                return;
+            }
+            if ((texture->usage() & MTL::TextureUsageRenderTarget) == 0) {
+                return;
+            }
+            MTL::RenderPassDescriptor* clear_pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+            clear_pass->colorAttachments()->object(0)->setTexture(texture);
+            clear_pass->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionClear);
+            clear_pass->colorAttachments()->object(0)->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 1.0));
+            clear_pass->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
+            MTL::CommandBuffer* clear_cb = mCommandQueue->commandBuffer();
+            clear_cb->setLabel(NS::String::string("Clear new RT to black", NS::UTF8StringEncoding));
+            MTL::RenderCommandEncoder* clear_enc = clear_cb->renderCommandEncoder(clear_pass);
+            clear_enc->endEncoding();
+            clear_cb->commit();
+        };
+        initRenderTargetToBlack(tex.texture);
+        if (msaa_level > 1) {
+            initRenderTargetToBlack(tex.msaaTexture);
         }
 
         if (render_target) {
@@ -1038,6 +1116,42 @@ void GfxRenderingAPIMetal::CopyFramebuffer(int fb_dst_id, int fb_src_id, int src
     int target_texture_id = mFramebuffers[fb_dst_id].mTextureId;
     MTL::Texture* target_texture = mTextures[target_texture_id].texture;
 
+    // Standalone path: when called between frames (e.g. SSB64 framebuffer-
+    // capture bridge from a game-thread task FuncStart), the source FB has
+    // no live mCommandBuffer/mCommandEncoder -- EndFrame nulls them. Fall
+    // back to a fresh, self-contained command buffer + blit encoder, modeled
+    // after ReadFramebufferToCPU below. The blit reads the prior frame's
+    // committed pixels (command queues are FIFO so this runs after any
+    // pending render commands targeting the source FB).
+    if (source_framebuffer.mCommandBuffer == nullptr) {
+        NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
+
+        MTL::CommandBuffer* cb = mCommandQueue->commandBuffer();
+        cb->setLabel(NS::String::string("Standalone Copy Framebuffer Command Buffer", NS::UTF8StringEncoding));
+
+        MTL::BlitCommandEncoder* blit_encoder = cb->blitCommandEncoder();
+        blit_encoder->setLabel(
+            NS::String::string("Standalone Copy Framebuffer Encoder", NS::UTF8StringEncoding));
+
+        MTL::Origin source_origin = MTL::Origin(srcX0, srcY0, 0);
+        MTL::Origin target_origin = MTL::Origin(dstX0, dstY0, 0);
+        MTL::Size source_size = MTL::Size(srcX1 - srcX0, srcY1 - srcY0, 1);
+
+        blit_encoder->copyFromTexture(source_texture, 0, 0, source_origin, source_size, target_texture, 0, 0,
+                                      target_origin);
+        blit_encoder->endEncoding();
+
+        cb->commit();
+        // Wait so the destination texture is ready to be sampled by any draw
+        // submitted in the same frame as the eventual SelectTextureFb call.
+        // The standalone path is rare (only at scene-transition boundaries
+        // like 1P stage clear or VS results) and the blit itself is cheap.
+        cb->waitUntilCompleted();
+
+        autorelease_pool->release();
+        return;
+    }
+
     // End the current render encoder
     source_framebuffer.mCommandEncoder->endEncoding();
 
@@ -1147,6 +1261,12 @@ void GfxRenderingAPIMetal::GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id,
     });
 
     command_buffer->commit();
+    // ReadFramebufferToCPU is contract-synchronous (its OpenGL and D3D11
+    // peers block via glReadPixels / Map). Without this wait the caller
+    // returns to a still-zeroed rgba16_buf because the completion handler
+    // hasn't fired yet -- breaks SSB64's wallpaper FB-capture (issue #57)
+    // and the OTR_G_READFB GBI handler.
+    command_buffer->waitUntilCompleted();
 
     compute_pipeline_state->release();
     autorelease_pool->release();
@@ -1175,11 +1295,21 @@ bool Metal_IsSupported() {
     // iOS always supports Metal and MTLCopyAllDevices is not available
     return true;
 #else
+    // MTLCopyAllDevices() returns a retained, autoreleased NSArray. Calling
+    // it from a C++ context without an NSAutoreleasePool in scope crashes on
+    // some macOS versions because the framework assumes there is one to
+    // register the return value against. Wrap the probe in an explicit pool
+    // so detection is safe no matter who invoked us.
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+
     NS::Array* devices = MTLCopyAllDevices();
-    NS::UInteger count = devices->count();
+    NS::UInteger count = (devices != nullptr) ? devices->count() : 0;
 
-    devices->release();
+    if (devices != nullptr) {
+        devices->release();
+    }
 
+    pool->release();
     return count > 0;
 #endif
 }

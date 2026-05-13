@@ -1,5 +1,9 @@
 #define NOMINMAX
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -9,7 +13,9 @@
 #include <stdio.h>
 
 #include <any>
+#include <atomic>
 #include <map>
+#include <memory>
 #include <set>
 #include <unordered_map>
 #include <vector>
@@ -28,6 +34,36 @@
 #include "fast/lus_gbi.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
+
+/* DIAG-ONLY: pre-deref ASan check in gfx_step(). When the interpreter is
+   about to read a Gfx command from poisoned memory (typically a stale
+   segment binding resolving to a freed/past-end heap address), dump the
+   full segment table + recent segment writes + recent G_DL calls so the
+   PR #133 lead-gap can be identified before ASan halts.
+
+   Nested #if rather than a single `defined(__has_feature) && __has_feature(...)`
+   because MSVC's preprocessor doesn't reliably short-circuit on unknown
+   identifiers — it tries to parse __has_feature(address_sanitizer) even
+   when defined(__has_feature) is false, producing C1012. GCC defines
+   __SANITIZE_ADDRESS__ when -fsanitize=address; clang has __has_feature;
+   MSVC defines __SANITIZE_ADDRESS__ for /fsanitize=address. */
+#if defined(__SANITIZE_ADDRESS__)
+#define PORT_DIAG_HAVE_ASAN 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define PORT_DIAG_HAVE_ASAN 1
+#  endif
+#endif
+#ifdef PORT_DIAG_HAVE_ASAN
+#include <sanitizer/asan_interface.h>
+#endif
+
+extern "C" void* portRelocTryResolvePointer(uint32_t token);
+extern "C" bool portRelocFindContainingFile(const void* ptr, uintptr_t* out_base, size_t* out_size);
+extern "C" bool portRelocDescribePointer(const void* ptr, uintptr_t* out_base, size_t* out_size,
+                                         uint32_t* out_file_id, const char** out_path);
+extern "C" void portRelocFixupVertexAtRuntime(const void *addr, unsigned int num_vtx);
+extern "C" void portRelocFixupTextureAtRuntime(const void *addr, unsigned int num_bytes);
 
 #include "ship/window/gui/Gui.h"
 #include "ship/resource/ResourceManager.h"
@@ -64,9 +100,266 @@ std::stack<std::string> currentDir;
 
 #define TEXTURE_CACHE_MAX_SIZE 1024
 
+namespace {
+
+constexpr size_t PORT_PACKED_GFX_SIZE = sizeof(uint32_t) * 2;
+
+struct PortPackedDisplayListInfo {
+    const void* source;
+    uintptr_t fileBase;
+    size_t fileSize;
+    std::shared_ptr<std::vector<Fast::F3DGfx>> commands;
+};
+
+std::unordered_map<const void*, PortPackedDisplayListInfo> sPortPackedDisplayListCache;
+
+bool portFindNormalizedDisplayListCommand(const Fast::F3DGfx* cmd, const PortPackedDisplayListInfo** outInfo,
+                                          size_t* outIndex) {
+    for (const auto& [source, info] : sPortPackedDisplayListCache) {
+        const Fast::F3DGfx* begin = info.commands->data();
+        const Fast::F3DGfx* end = begin + info.commands->size();
+
+        if ((cmd >= begin) && (cmd < end)) {
+            if (outInfo != nullptr) {
+                *outInfo = &info;
+            }
+            if (outIndex != nullptr) {
+                *outIndex = static_cast<size_t>(cmd - begin);
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
+Fast::F3DGfx* portNormalizeDisplayListPointer(Fast::F3DGfx* dlist) {
+    uintptr_t fileBase = 0;
+    size_t fileSize = 0;
+
+    if (dlist == nullptr || !portRelocFindContainingFile(dlist, &fileBase, &fileSize)) {
+        return dlist;
+    }
+
+    // Guard: runtime display lists (built on the graphics heap with native 16-byte
+    // Gfx structs) can fall within a reloc file's address range because both share
+    // the same game heap.  Detect native format by checking the upper 32 bits of
+    // uintptr_t w0 fields at THREE command positions.
+    //
+    // Layout comparison (as uint32_t[]):
+    //   Native 16-byte:  [w0_lo] [w0_hi=0] [w1_lo] [w1_hi] [w0_lo] [w0_hi=0] ...
+    //   Packed  8-byte:  [w0]    [w1]      [w0]    [w1]    [w0]    [w1]      ...
+    //
+    // For native format, probe[1], probe[5], and probe[9] are upper halves of
+    // uintptr_t w0 fields — always zero because GBI opcodes fit in 32 bits.
+    // For packed format, these are w1 of packed commands 0, 2, and 4.  Having
+    // ALL THREE be zero requires 5+ commands where every other one has w1=0
+    // (e.g. alternating syncs), which is virtually impossible in real DLs.
+    {
+        uintptr_t rawAddr_chk = reinterpret_cast<uintptr_t>(dlist);
+        uintptr_t fileEnd_chk = fileBase + fileSize;
+        const uint32_t* probe = reinterpret_cast<const uint32_t*>(dlist);
+
+        // DISABLED: All data-inspection heuristics have false positives.
+        // Packed DLs often start with commands that have w1=0 (sync, fog, geometry
+        // mode).  Instead of guessing, we ALWAYS normalize data found in a reloc
+        // file range.  If a native runtime DL somehow lands in a reloc range, the
+        // normalization loop's opcode validator will bail out early and produce a
+        // harmless truncated DL with G_ENDDL.
+        (void)probe;
+        (void)rawAddr_chk;
+        (void)fileEnd_chk;
+    }
+
+    auto cached = sPortPackedDisplayListCache.find(dlist);
+
+    if (cached != sPortPackedDisplayListCache.end()) {
+        return cached->second.commands->data();
+    }
+
+    uintptr_t rawAddr = reinterpret_cast<uintptr_t>(dlist);
+    uintptr_t fileEnd = fileBase + fileSize;
+
+    if ((rawAddr < fileBase) || ((fileEnd - rawAddr) < PORT_PACKED_GFX_SIZE)) {
+        return dlist;
+    }
+
+    auto translated = std::make_shared<std::vector<Fast::F3DGfx>>();
+    translated->reserve((fileEnd - rawAddr) / PORT_PACKED_GFX_SIZE);
+
+    while ((rawAddr + PORT_PACKED_GFX_SIZE) <= fileEnd) {
+        const uint32_t* rawWords = reinterpret_cast<const uint32_t*>(rawAddr);
+        uint8_t opcode = (uint8_t)(rawWords[0] >> 24);
+
+        // Valid F3DEX2 opcodes: 0x00-0x0F (SP geometry) and 0xD7-0xFF (SP/RDP).
+        // Anything in 0x10-0xD6 is not a real GBI command — we've entered
+        // non-DL data (textures, vertices, structs) adjacent in the blob.
+        if (opcode > 0x0F && opcode < 0xD7) {
+            break;
+        }
+
+        Fast::F3DGfx hostCmd = {};
+
+        hostCmd.words.w0 = rawWords[0];
+
+        // Rewrite segment E (intra-file) references to absolute file addresses.
+        // Resource DLs use 0x0E + offset for textures, vertices, matrices, and
+        // sub-display-lists within the same reloc file blob.
+        //
+        // EXCEPTION: G_DL.  Some scenes (e.g. mvOpeningRoom) build per-MObj
+        // material setup sub-DLs in the graphics heap at runtime and patch
+        // segment 0x0E to point at that heap via gsSPSegment(0xE, ...).  Stored
+        // model DLs then call into them with `gsSPDisplayList(0x0E000000+X)`.
+        // For these, we MUST defer resolution to interpreter execution time so
+        // the runtime segment table is consulted.  Other scenes (e.g. the N64
+        // logo) use seg=0x0E G_DL as intra-file branches; gfx_dl_handler_common
+        // falls back to fileBase + offset when the runtime segment is unset.
+        uint32_t w1_raw = rawWords[1];
+        uint8_t seg = (w1_raw >> 24) & 0xFF;
+        uint32_t offset = w1_raw & 0x00FFFFFF;
+
+        if (seg == 0x0E && offset < fileSize &&
+            opcode != (uint8_t)Fast::F3DEX2_G_DL) {
+            hostCmd.words.w1 = fileBase + offset;
+        } else {
+            hostCmd.words.w1 = w1_raw;
+        }
+
+        translated->push_back(hostCmd);
+
+        rawAddr += PORT_PACKED_GFX_SIZE;
+
+        if (opcode == (uint8_t)Fast::F3DEX2_G_ENDDL) {
+            break;
+        }
+    }
+
+    // Ensure the widened DL always ends with G_ENDDL.  The opcode validation
+    // can terminate the loop early, and some source DLs use gSPBranchList
+    // (never returns) instead of gSPEndDisplayList.  Without a terminator
+    // the interpreter reads past the vector into uninitialized heap.
+    {
+        bool hasEndDL = !translated->empty() &&
+            ((uint8_t)(translated->back().words.w0 >> 24) == (uint8_t)Fast::F3DEX2_G_ENDDL);
+        if (!hasEndDL) {
+            Fast::F3DGfx endCmd = {};
+            endCmd.words.w0 = ((uintptr_t)(uint8_t)Fast::F3DEX2_G_ENDDL) << 24;
+            translated->push_back(endCmd);
+        }
+    }
+
+    Fast::F3DGfx* translatedPtr = translated->data();
+    sPortPackedDisplayListCache.emplace(dlist, PortPackedDisplayListInfo{ dlist, fileBase, fileSize, translated });
+
+    return translatedPtr;
+}
+
+size_t portGetDisplayListStride(uintptr_t segmentBase) {
+    uintptr_t fileBase = 0;
+    size_t fileSize = 0;
+
+    if ((segmentBase != 0) && portRelocFindContainingFile(reinterpret_cast<const void*>(segmentBase), &fileBase, &fileSize)) {
+        return PORT_PACKED_GFX_SIZE;
+    }
+
+    return sizeof(Fast::F3DGfx);
+}
+
+bool gfxPointerHasReadableBytes(const void* ptr, size_t size) {
+    if (ptr == nullptr || size == 0) {
+        return false;
+    }
+
+#ifdef _WIN32
+    const uint8_t* cursor = reinterpret_cast<const uint8_t*>(ptr);
+    size_t remaining = size;
+
+    while (remaining != 0) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+
+        if (VirtualQuery(cursor, &mbi, sizeof(mbi)) != sizeof(mbi)) {
+            return false;
+        }
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+            return false;
+        }
+
+        DWORD protect = mbi.Protect & 0xFF;
+
+        switch (protect) {
+            case PAGE_READONLY:
+            case PAGE_READWRITE:
+            case PAGE_WRITECOPY:
+            case PAGE_EXECUTE_READ:
+            case PAGE_EXECUTE_READWRITE:
+            case PAGE_EXECUTE_WRITECOPY:
+                break;
+
+            default:
+                return false;
+        }
+
+        uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        size_t available = regionEnd - reinterpret_cast<uintptr_t>(cursor);
+
+        if (available >= remaining) {
+            return true;
+        }
+
+        remaining -= available;
+        cursor += available;
+    }
+#endif
+
+    return true;
+}
+
+} // namespace
+
+extern "C" void portResetPackedDisplayListCache(void) {
+    sPortPackedDisplayListCache.clear();
+}
+
+// Evict cached widened display lists whose source heap address falls in a
+// range that's about to be overwritten by a fresh reloc-file load.  Same
+// pattern as Interpreter::TextureCacheDeleteRange / portTextureCacheDeleteRange,
+// applied to the packed-DL widening cache.  Without this, bump-reset heaps
+// (stage-select wallpaper rewinds, classic-mode round transitions reusing the
+// extern heap, CSS hover reloads) hit a stale cached widening that points at
+// the prior file's bytes via cached fileBase/fileSize — manifests as G_VTX
+// unresolved-segment skips and Unhandled OP-code bursts (issue #103/#128).
+extern "C" void portPackedDisplayListCacheDeleteRange(const void* base, size_t size) {
+    if (base == nullptr || size == 0) {
+        return;
+    }
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t hi = lo + size;
+    for (auto it = sPortPackedDisplayListCache.begin(); it != sPortPackedDisplayListCache.end(); ) {
+        const uintptr_t srcAddr = reinterpret_cast<uintptr_t>(it->first);
+        bool evict = srcAddr >= lo && srcAddr < hi;
+        if (!evict) {
+            for (const Fast::F3DGfx& cmd : *it->second.commands) {
+                const uintptr_t w1 = cmd.words.w1;
+                if (w1 >= lo && w1 < hi) {
+                    evict = true;
+                    break;
+                }
+            }
+        }
+        if (evict) {
+            it = sPortPackedDisplayListCache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 namespace Fast {
 
 static UcodeHandlers ucode_handler_index = ucode_f3dex2;
+
+/* GBI trace callback — forward declaration (defined near g_exec_stack below) */
+static GbiTraceCallbackFn sGbiTraceCallback = nullptr;
 
 const static uint32_t f3dex2AttrHandler[] = {
     F3DEX2_G_MTX_PROJECTION, F3DEX2_G_MTX_LOAD,  F3DEX2_G_MTX_PUSH,  F3DEX_G_MTX_NOPUSH,
@@ -109,6 +402,10 @@ constexpr size_t MAX_TRI_BUFFER = 256;
 Interpreter::Interpreter() {
     mRsp = new RSP();
     mRdp = new RDP();
+    // Point palette pointers at staging buffers so CI8 rendering always has
+    // valid pointers even when only one palette half has been loaded via TLUT.
+    mRdp->palettes[0] = mRdp->palette_staging[0];
+    mRdp->palettes[1] = mRdp->palette_staging[1];
     mBufVbo = new float[MAX_TRI_BUFFER * (32 * 3)];
 }
 
@@ -119,10 +416,94 @@ Interpreter::~Interpreter() {
 }
 
 static std::weak_ptr<Interpreter> mInstance;
+
 // Set a cached pointer to the instance so we don't need to go through the window every time
 void GfxSetInstance(std::shared_ptr<Interpreter> gfx) {
     mInstance = gfx;
 }
+
+/* ─── DIAG-ONLY: PR #133 lead-gap tracing ─────────────────────────────────
+   Ring buffers of recent segment writes and recent DL pushes. Dumped from
+   gfx_step() when ASan reports the next cmd lives in poisoned memory.
+   Entirely gated on PORT_DIAG_HAVE_ASAN — non-ASan release builds compile
+   to zero bytes here and at every call site. */
+#ifdef PORT_DIAG_HAVE_ASAN
+namespace {
+struct DiagSegWrite {
+    int segNum;
+    uintptr_t oldVal;
+    uintptr_t newVal;
+    const char* where;  // string literal — never freed
+    uint32_t ucode;
+    uint64_t frame;
+};
+struct DiagDLPush {
+    uintptr_t caller_w0;
+    uintptr_t caller_w1;
+    void* callee;
+    void* callee_normalized;
+    const char* where;
+    uint32_t ucode;
+    uint64_t frame;
+};
+constexpr size_t DIAG_RING = 32;
+DiagSegWrite sDiagSegWrites[DIAG_RING] = {};
+size_t sDiagSegWritesIdx = 0;
+DiagDLPush sDiagDLPushes[DIAG_RING] = {};
+size_t sDiagDLPushesIdx = 0;
+uint64_t sDiagFrame = 0;
+}  // namespace
+
+extern "C" void portDiagBumpFrame() {
+    ++sDiagFrame;
+}
+
+static inline void diagRecordSegWrite(int segNum, uintptr_t oldVal, uintptr_t newVal,
+                                      const char* where, uint32_t ucode) {
+    sDiagSegWrites[sDiagSegWritesIdx] = { segNum, oldVal, newVal, where, ucode, sDiagFrame };
+    sDiagSegWritesIdx = (sDiagSegWritesIdx + 1) % DIAG_RING;
+}
+
+static inline void diagRecordDLPush(F3DGfx* caller, F3DGfx* callee, F3DGfx* normalized,
+                                    const char* where) {
+    sDiagDLPushes[sDiagDLPushesIdx] = {
+        caller ? (uintptr_t)caller->words.w0 : 0,
+        caller ? (uintptr_t)caller->words.w1 : 0,
+        (void*)callee, (void*)normalized, where, 0, sDiagFrame
+    };
+    sDiagDLPushesIdx = (sDiagDLPushesIdx + 1) % DIAG_RING;
+}
+
+static void diagDumpAll(F3DGfx* badCmd, const char* reason) {
+    SPDLOG_CRITICAL("==== PR#133 LEAD-GAP DIAG ({}) ====", reason);
+    SPDLOG_CRITICAL("badCmd host={} frame={}", (void*)badCmd, sDiagFrame);
+    if (auto inst = mInstance.lock()) {
+        SPDLOG_CRITICAL("-- segment table --");
+        for (int i = 0; i < MAX_SEGMENT_POINTERS; ++i) {
+            if (inst->mSegmentPointers[i] != 0) {
+                SPDLOG_CRITICAL("  seg[{:#x}] = {:#x}", i, inst->mSegmentPointers[i]);
+            }
+        }
+    }
+    SPDLOG_CRITICAL("-- recent segment writes (oldest first, {} slots) --", DIAG_RING);
+    for (size_t i = 0; i < DIAG_RING; ++i) {
+        size_t k = (sDiagSegWritesIdx + i) % DIAG_RING;
+        const auto& e = sDiagSegWrites[k];
+        if (!e.where) continue;
+        SPDLOG_CRITICAL("  [frame={}] seg[{:#x}] {:#x} -> {:#x} ({})",
+                        e.frame, e.segNum, e.oldVal, e.newVal, e.where);
+    }
+    SPDLOG_CRITICAL("-- recent DL pushes (oldest first) --");
+    for (size_t i = 0; i < DIAG_RING; ++i) {
+        size_t k = (sDiagDLPushesIdx + i) % DIAG_RING;
+        const auto& e = sDiagDLPushes[k];
+        if (!e.where) continue;
+        SPDLOG_CRITICAL("  [frame={}] caller w0={:#x} w1={:#x} callee={} norm={} ({})",
+                        e.frame, e.caller_w0, e.caller_w1, e.callee, e.callee_normalized, e.where);
+    }
+    SPDLOG_CRITICAL("==== END DIAG ====");
+}
+#endif  // PORT_DIAG_HAVE_ASAN
 
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
@@ -132,12 +513,21 @@ void Interpreter::Flush() {
     }
 }
 
+static std::set<std::pair<uint64_t,uint64_t>> sFailedShaderIds;
+
 ShaderProgram* Interpreter::LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1) {
+    auto key = std::make_pair(id0, id1);
+    if (sFailedShaderIds.count(key)) {
+        return nullptr; // Previously failed — don't retry
+    }
     ShaderProgram* prg = mRapi->LookupShader(id0, id1);
     if (prg == nullptr) {
         mRapi->UnloadShader(mRenderingState.mShaderProgram);
         prg = mRapi->CreateAndLoadNewShader(id0, id1);
         mRenderingState.mShaderProgram = prg;
+        if (prg == nullptr) {
+            sFailedShaderIds.insert(key);
+        }
     }
     return prg;
 }
@@ -469,9 +859,59 @@ std::string_view Interpreter::GetBaseTexturePath(std::string_view path) {
     return path;
 }
 
+void Interpreter::TextureCacheDeleteRange(const uint8_t* base, size_t size) {
+    if (base == nullptr || size == 0) {
+        return;
+    }
+    const uint8_t* end = base + size;
+    for (auto it = mTextureCache.map.begin(); it != mTextureCache.map.end(); ) {
+        if (it->first.texture_addr >= base && it->first.texture_addr < end) {
+            for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
+                if (mRenderingState.mTextures[j] == &*it) {
+                    mRenderingState.mTextures[j] = nullptr;
+                }
+            }
+            mTextureCache.lru.erase(it->second.lru_location);
+            mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+            it = mTextureCache.map.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+extern "C" void portTextureCacheDeleteRange(const void* base, size_t size) {
+    auto inst = mInstance.lock();
+    if (!inst) {
+        return;
+    }
+    inst->TextureCacheDeleteRange(static_cast<const uint8_t*>(base), size);
+}
+
+void Interpreter::ResetRdpTextureState() {
+    mRdp->texture_to_load.addr = nullptr;
+    mRdp->texture_to_load.siz = 0;
+    mRdp->texture_to_load.width = 0;
+    mRdp->texture_to_load.tex_flags = 0;
+    mRdp->texture_to_load.raw_tex_metadata = {};
+
+    for (int i = 0; i < 2; i++) {
+        mRdp->loaded_texture[i].addr = nullptr;
+        mRdp->loaded_texture[i].orig_size_bytes = 0;
+        mRdp->loaded_texture[i].size_bytes = 0;
+        mRdp->loaded_texture[i].full_image_line_size_bytes = 0;
+        mRdp->loaded_texture[i].line_size_bytes = 0;
+        mRdp->loaded_texture[i].tex_flags = 0;
+        mRdp->loaded_texture[i].raw_tex_metadata = {};
+        mRdp->loaded_texture[i].masked = false;
+        mRdp->loaded_texture[i].blended = false;
+        mRdp->textures_changed[i] = true;
+    }
+}
+
 void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
     while (mTextureCache.map.bucket_count() > 0) {
-        TextureCacheKey key = { origAddr, { 0 }, 0, 0, 0 }; // bucket index only depends on the address
+        TextureCacheKey key = { origAddr, { 0 }, 0, 0, 0, 0, 0, 0, 0 }; // bucket index only depends on the address
         size_t bucket = mTextureCache.map.bucket(key);
         bool again = false;
         for (auto it = mTextureCache.map.begin(bucket); it != mTextureCache.map.end(bucket); ++it) {
@@ -505,6 +945,293 @@ static uint32_t GetEffectiveLineSize(uint32_t lineSizeBytes, uint32_t fullImageL
     return tileLineSizeBytes;
 }
 
+// Clamp an upload-width to the tile's SetTileSize extent.  The game sets
+// SetTileSize(0, 0, (width-1)<<2, (height-1)<<2) to mark the drawable
+// tile area — on N64 hardware the sampler clamps s/t past these bounds
+// and the out-of-bounds texels are never read.  On the port, though,
+// ImportTexture* uploads the full TMEM line stride (rounded up from
+// `width` to qword alignment, so `width_img` ≥ `width`) as the GPU
+// texture width, while `GfxSpTri1` normalizes UV by the SetTileSize
+// clamped width.  The mismatch stretches the texture: sampling at the
+// rightmost drawn pixel lands on GPU col `width_img - 1` instead of
+// `width - 1`, so any trailing bytes in [width, width_img) bleed into
+// the render (the original MARIO title-card smear) and the bilinear
+// filter at the right edge can't average with a real clamped-edge
+// value (the later title-border dim slice).
+//
+// Fix: when SetTileSize declares a drawable extent smaller than the
+// natural TMEM line size, also clamp the upload width to match so the
+// GPU texture is exactly `width` pixels wide.  Then the UV
+// normalization, the SpTri1 tex_width clamp, and OpenGL's
+// CLAMP_TO_EDGE all agree on the same right-edge pixel.
+//
+// `naturalWidthPixels` is the per-row texel count before clamping.
+// `tile_uls` / `tile_lrs` are in S10.2 (texel * 4) units.
+static uint32_t ClampUploadWidthToTile(uint32_t naturalWidthPixels, uint32_t tile_uls, uint32_t tile_lrs) {
+    if (tile_lrs > tile_uls) {
+        uint32_t clampPixels = (tile_lrs - tile_uls + 4) / 4;
+        if (clampPixels > 0 && clampPixels < naturalWidthPixels) {
+            return clampPixels;
+        }
+    }
+    return naturalWidthPixels;
+}
+
+static bool Ssb64RenderDiagEnabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* value = getenv("SSB64_RENDER_DIAG");
+        enabled = (value != nullptr && value[0] != '\0' && value[0] != '0') ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+static int Ssb64RenderDiagLimit() {
+    static int limit = -1;
+    if (limit < 0) {
+        const char* value = getenv("SSB64_RENDER_DIAG_LIMIT");
+        limit = value != nullptr && value[0] != '\0' ? atoi(value) : 400;
+        if (limit <= 0) {
+            limit = 400;
+        }
+    }
+    return limit;
+}
+
+static bool Ssb64RenderDiagTakeSlot() {
+    static int count = 0;
+    if (!Ssb64RenderDiagEnabled()) {
+        return false;
+    }
+    if (count >= Ssb64RenderDiagLimit()) {
+        return false;
+    }
+    count++;
+    return true;
+}
+
+static std::string Ssb64RenderDiagTexturePath(const RawTexMetadata* metadata, const void* addr) {
+    if (metadata != nullptr && metadata->resource != nullptr) {
+        return metadata->resource->GetInitData()->Path;
+    }
+
+    const char* relocPath = nullptr;
+    if (addr != nullptr && portRelocDescribePointer(addr, nullptr, nullptr, nullptr, &relocPath) && relocPath != nullptr) {
+        return relocPath;
+    }
+
+    return "(raw)";
+}
+
+static bool Ssb64RenderDiagDescribePointer(const void* addr, uintptr_t* base, size_t* size, uint32_t* fileId) {
+    if (addr == nullptr) {
+        return false;
+    }
+    return portRelocDescribePointer(addr, base, size, fileId, nullptr);
+}
+
+static bool Ssb64RenderDiagFileIdMatches(uint32_t fileId, const char* list) {
+    if (list == nullptr || list[0] == '\0') {
+        return false;
+    }
+
+    const char* cursor = list;
+    while (*cursor != '\0') {
+        char* end = nullptr;
+        unsigned long parsed = strtoul(cursor, &end, 0);
+        if (end != cursor && static_cast<uint32_t>(parsed) == fileId) {
+            return true;
+        }
+        cursor = end != cursor ? end : cursor + 1;
+        while (*cursor == ',' || *cursor == ' ' || *cursor == ';' || *cursor == ':') {
+            cursor++;
+        }
+    }
+
+    return false;
+}
+
+static bool Ssb64RenderDiagParseUlongEnv(const char* name, unsigned long* out) {
+    const char* value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+
+    char* end = nullptr;
+    unsigned long parsed = strtoul(value, &end, 0);
+    if (end == value) {
+        return false;
+    }
+
+    *out = parsed;
+    return true;
+}
+
+static bool Ssb64RenderDiagNamedFilterMatches(uint32_t fileId, const char* filter) {
+    if (filter == nullptr) {
+        return false;
+    }
+
+    if (strcmp(filter, "Star") == 0 || strcmp(filter, "star") == 0) {
+        return fileId == 0xfb || fileId == 0xff || fileId == 0x58 || fileId == 0x2c;
+    }
+    if (strcmp(filter, "Samus") == 0 || strcmp(filter, "samus") == 0) {
+        return fileId == 0xd9 || fileId == 0x140 || fileId == 0x135 || fileId == 0xda || fileId == 0x15d;
+    }
+    if (strcmp(filter, "DreamLand") == 0 || strcmp(filter, "dreamland") == 0 || strcmp(filter, "Pupupu") == 0 ||
+        strcmp(filter, "pupupu") == 0) {
+        return fileId == 0x58 || fileId == 0xff || fileId == 0x100 || fileId == 0x102;
+    }
+
+    return false;
+}
+
+static bool Ssb64RenderDiagMatches(const RawTexMetadata* metadata, const void* addr) {
+    if (!Ssb64RenderDiagEnabled()) {
+        return false;
+    }
+
+    static bool announced = false;
+    if (!announced) {
+        const char* filter = getenv("SSB64_RENDER_DIAG_FILTER");
+        const char* fileIds = getenv("SSB64_RENDER_DIAG_FILE_ID");
+        const char* minOff = getenv("SSB64_RENDER_DIAG_MIN_OFF");
+        const char* maxOff = getenv("SSB64_RENDER_DIAG_MAX_OFF");
+        SPDLOG_INFO("SSB64_RENDER_DIAG active filter='{}' file_ids='{}' min_off='{}' max_off='{}' limit={}",
+                    filter != nullptr ? filter : "", fileIds != nullptr ? fileIds : "", minOff != nullptr ? minOff : "",
+                    maxOff != nullptr ? maxOff : "", Ssb64RenderDiagLimit());
+        announced = true;
+    }
+
+    uintptr_t base = 0;
+    size_t size = 0;
+    uint32_t fileId = 0;
+    bool hasReloc = Ssb64RenderDiagDescribePointer(addr, &base, &size, &fileId);
+    unsigned long minOff = 0;
+    unsigned long maxOff = 0;
+    bool hasMinOff = Ssb64RenderDiagParseUlongEnv("SSB64_RENDER_DIAG_MIN_OFF", &minOff);
+    bool hasMaxOff = Ssb64RenderDiagParseUlongEnv("SSB64_RENDER_DIAG_MAX_OFF", &maxOff);
+    if (hasMinOff || hasMaxOff) {
+        if (!hasReloc) {
+            return false;
+        }
+
+        uintptr_t offset = reinterpret_cast<uintptr_t>(addr) - base;
+        if (hasMinOff && offset < minOff) {
+            return false;
+        }
+        if (hasMaxOff && offset > maxOff) {
+            return false;
+        }
+    }
+
+    const char* fileIdFilter = getenv("SSB64_RENDER_DIAG_FILE_ID");
+    if (hasReloc && Ssb64RenderDiagFileIdMatches(fileId, fileIdFilter)) {
+        return true;
+    }
+
+    const char* filter = getenv("SSB64_RENDER_DIAG_FILTER");
+    if ((filter == nullptr || filter[0] == '\0') && (fileIdFilter == nullptr || fileIdFilter[0] == '\0')) {
+        return true;
+    }
+
+    std::string path = Ssb64RenderDiagTexturePath(metadata, addr);
+    if (filter != nullptr && filter[0] != '\0' && path.find(filter) != std::string::npos) {
+        return true;
+    }
+    if (hasReloc && Ssb64RenderDiagNamedFilterMatches(fileId, filter)) {
+        return true;
+    }
+
+    return false;
+}
+
+static std::atomic<int> sArmedImportCaptureN{0};
+
+extern "C" void portDiagArmImportCapture(int n) {
+    sArmedImportCaptureN.store(n > 0 ? n : 0, std::memory_order_relaxed);
+}
+
+static bool Ssb64RenderDiagArmedTake() {
+    int prev = sArmedImportCaptureN.load(std::memory_order_relaxed);
+    while (prev > 0) {
+        if (sArmedImportCaptureN.compare_exchange_weak(prev, prev - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void Ssb64RenderDiagLogImport(const char* stage, const RawTexMetadata* metadata, const void* addr, int slot,
+                                     int tile, uint32_t tmemIndex, uint8_t fmt, uint8_t siz, uint8_t cms,
+                                     uint8_t cmt, uint8_t masks, uint8_t maskt, uint8_t shifts, uint8_t shiftt,
+                                     uint32_t lineBytes, uint32_t loadedLineBytes, uint32_t loadedFullLineBytes,
+                                     uint32_t sizeBytes, uint32_t origSizeBytes, uint32_t uls, uint32_t ult,
+                                     uint32_t lrs, uint32_t lrt, bool replacement) {
+    bool armed = Ssb64RenderDiagArmedTake();
+    if (!armed && (!Ssb64RenderDiagMatches(metadata, addr) || !Ssb64RenderDiagTakeSlot())) {
+        return;
+    }
+
+    uint32_t tileW = lrs > uls ? (lrs - uls + 4) / 4 : 0;
+    uint32_t tileH = lrt > ult ? (lrt - ult + 4) / 4 : 0;
+    uintptr_t base = 0;
+    size_t relocSize = 0;
+    uint32_t fileId = 0;
+    bool hasReloc = Ssb64RenderDiagDescribePointer(addr, &base, &relocSize, &fileId);
+    SPDLOG_INFO(
+        "SSB64_RENDER_DIAG {} path='{}' addr={} file={} off=0x{:x} slot={} tile={} tmem={} fmt={} siz={} cms={} "
+        "cmt={} masks={} maskt={} shifts={} shiftt={} line={} loadedLine={} fullLine={} size={} origSize={} "
+        "tileST=({},{})->({},{}), tileWH={}x{} replacement={}",
+        stage, Ssb64RenderDiagTexturePath(metadata, addr), addr, hasReloc ? fileId : 0,
+        hasReloc ? static_cast<uintptr_t>(reinterpret_cast<uintptr_t>(addr) - base) : 0, slot, tile, tmemIndex, fmt,
+        siz, cms, cmt, masks, maskt, shifts, shiftt, lineBytes, loadedLineBytes, loadedFullLineBytes, sizeBytes,
+        origSizeBytes, uls, ult, lrs, lrt, tileW, tileH, replacement);
+}
+
+static void Ssb64RenderDiagLogUpload(const char* decoder, const RawTexMetadata* metadata, const void* addr, int tile,
+                                     uint32_t tmemIndex, uint32_t width, uint32_t height) {
+    if (!Ssb64RenderDiagMatches(metadata, addr) || !Ssb64RenderDiagTakeSlot()) {
+        return;
+    }
+
+    uintptr_t base = 0;
+    size_t size = 0;
+    uint32_t fileId = 0;
+    bool hasReloc = Ssb64RenderDiagDescribePointer(addr, &base, &size, &fileId);
+    SPDLOG_INFO("SSB64_RENDER_DIAG upload decoder={} path='{}' addr={} file={} off=0x{:x} tile={} tmem={} uploadWH={}x{}",
+                decoder, Ssb64RenderDiagTexturePath(metadata, addr), addr, hasReloc ? fileId : 0,
+                hasReloc ? static_cast<uintptr_t>(reinterpret_cast<uintptr_t>(addr) - base) : 0, tile, tmemIndex, width,
+                height);
+}
+
+static void Ssb64RenderDiagLogDraw(const RawTexMetadata* metadata, const void* addr, int slot, int tile,
+                                   uint32_t tmemIndex, uint8_t fmt, uint8_t siz, uint8_t cms, uint8_t cmt,
+                                   uint8_t masks, uint8_t maskt, uint8_t shifts, uint8_t shiftt,
+                                   uint32_t texWidth, uint32_t texHeight, uint32_t tileWidth, uint32_t tileHeight,
+                                   float rawUMin, float rawUMax, float rawVMin, float rawVMax, float normUMin,
+                                   float normUMax, float normVMin, float normVMax, float x0, float y0, float z0,
+                                   float w0, float x1, float y1, float z1, float w1, float x2, float y2, float z2,
+                                   float w2) {
+    if (!Ssb64RenderDiagMatches(metadata, addr) || !Ssb64RenderDiagTakeSlot()) {
+        return;
+    }
+
+    uintptr_t base = 0;
+    size_t relocSize = 0;
+    uint32_t fileId = 0;
+    bool hasReloc = Ssb64RenderDiagDescribePointer(addr, &base, &relocSize, &fileId);
+    SPDLOG_INFO(
+        "SSB64_RENDER_DIAG draw path='{}' addr={} file={} off=0x{:x} slot={} tile={} tmem={} fmt={} siz={} cms={} cmt={} masks={} maskt={} "
+        "shifts={} shiftt={} texWH={}x{} tileWH={}x{} rawUV=({:.3f}..{:.3f},{:.3f}..{:.3f}) "
+        "normUV=({:.5f}..{:.5f},{:.5f}..{:.5f}) clip=({:.3f},{:.3f},{:.3f},{:.3f}) "
+        "({:.3f},{:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f},{:.3f})",
+        Ssb64RenderDiagTexturePath(metadata, addr), addr, hasReloc ? fileId : 0,
+        hasReloc ? static_cast<uintptr_t>(reinterpret_cast<uintptr_t>(addr) - base) : 0, slot, tile, tmemIndex, fmt,
+        siz, cms, cmt, masks, maskt, shifts, shiftt, texWidth, texHeight, tileWidth, tileHeight, rawUMin, rawUMax,
+        rawVMin, rawVMax, normUMin, normUMax, normVMin, normVMax, x0, y0, z0, w0, x1, y1, z1, w1, x2, y2, z2, w2);
+}
+
 void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
@@ -524,7 +1251,17 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
 
     uint32_t widthBytes = GetEffectiveLineSize(line_size_bytes, fullImageLineSizeBytes, sizeBytes,
                                                mRdp->texture_tile[tile].line_size_bytes);
-    uint32_t width = widthBytes / 2;
+    // naturalWidth = pre-clamp TMEM-line-derived pixel count. Used for the
+    // DRAM stride reassignment below so that the decode's source indexing
+    // stays consistent with the real row stride when `width` (the decode
+    // extent) gets clamped tighter by tile/mask bounds. Mirrors the
+    // ClampUploadWidthToTile fix landed for IA8/I4 (see
+    // docs/bugs/title_border_right_edge_slice_2026-04-14.md); without it the
+    // reassignment used the clamped width and pulled each subsequent row
+    // from the wrong offset → diagonal shear across every RGBA16 sprite
+    // whose `bitmap->width < bitmap->width_img`.
+    uint32_t naturalWidth = widthBytes / 2;
+    uint32_t width = naturalWidth;
     uint32_t height = widthBytes > 0 ? sizeBytes / widthBytes : 0;
 
     // Clamp to tile dimensions from SetTileSize (mipmap pyramids include all levels).
@@ -537,9 +1274,24 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
         height = tile_h;
     }
 
-    // A single line of pixels should not equal the entire image (height == 1 non-withstanding)
+    // PORT: clamp to masks/maskt wrap bounds. See ImportTextureCi4 for rationale.
+    if (mRdp->texture_tile[tile].masks > 0) {
+        uint32_t mask_w = 1u << mRdp->texture_tile[tile].masks;
+        if (mask_w > 0 && mask_w < width) {
+            width = mask_w;
+        }
+    }
+    if (mRdp->texture_tile[tile].maskt > 0) {
+        uint32_t mask_h = 1u << mRdp->texture_tile[tile].maskt;
+        if (mask_h > 0 && mask_h < height) {
+            height = mask_h;
+        }
+    }
+
+    // Set DRAM row stride from the *unclamped* naturalWidth when the
+    // LoadBlock was flat (no explicit width). See naturalWidth comment above.
     if (fullImageLineSizeBytes == sizeBytes) {
-        fullImageLineSizeBytes = width * 2;
+        fullImageLineSizeBytes = naturalWidth * 2;
     }
 
     uint32_t i = 0;
@@ -562,6 +1314,7 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
         }
     }
 
+    Ssb64RenderDiagLogUpload("RGBA16", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -584,7 +1337,10 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
 
     uint32_t widthBytes = GetEffectiveLineSize(line_size_bytes, full_image_line_size_bytes, size_bytes,
                                                mRdp->texture_tile[tile].line_size_bytes * 2);
-    uint32_t width = widthBytes / 4;
+    // See ImportTextureRgba16 for the naturalWidth / ClampUploadWidthToTile
+    // rationale — same class of bug, stretched across 4-byte pixels.
+    uint32_t naturalWidth = widthBytes / 4;
+    uint32_t width = naturalWidth;
     uint32_t height = widthBytes > 0 ? size_bytes / widthBytes : 0;
 
     // Clamp to tile dimensions from SetTileSize
@@ -598,7 +1354,7 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
     }
 
     if (full_image_line_size_bytes == size_bytes) {
-        full_image_line_size_bytes = width * 4;
+        full_image_line_size_bytes = naturalWidth * 4;
     }
 
     // Copy pixel by pixel, respecting full image stride (handles sub-tile loads)
@@ -636,12 +1392,23 @@ void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
 
     uint32_t widthBytes = GetEffectiveLineSize(lineSizeBytes, fullImageLineSizeBytes, sizeBytes,
                                                mRdp->texture_tile[tile].line_size_bytes);
-    uint32_t width = widthBytes * 2;
+    uint32_t naturalWidth = widthBytes * 2;
     uint32_t height = widthBytes > 0 ? sizeBytes / widthBytes : 0;
 
     if (fullImageLineSizeBytes == sizeBytes) {
         fullImageLineSizeBytes = widthBytes;
     }
+
+    // Clamp upload width to the SetTileSize extent. Same fix family as IA8/I4
+    // (see docs/bugs/title_border_right_edge_slice_2026-04-14.md). VS Record
+    // digit sprites are 4×7 IA4 tiles whose TMEM line stride rounds up to a
+    // 16-pixel-wide upload; without this clamp the upload is 16 pixels wide
+    // but `GfxSpTri1` normalises UVs by the SetTileSize-clamped tex_width=4,
+    // so each output pixel samples GPU column ~4·n instead of n — only ~1
+    // texel of useful digit data is visible per output column, producing the
+    // "squished" appearance reported in issue #2.
+    uint32_t width = ClampUploadWidthToTile(naturalWidth, mRdp->texture_tile[tile].uls,
+                                            mRdp->texture_tile[tile].lrs);
 
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
@@ -679,13 +1446,16 @@ void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
     uint32_t lineSizeBytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes;
 
-    uint32_t width = GetEffectiveLineSize(lineSizeBytes, fullImageLineSizeBytes, sizeBytes,
-                                          mRdp->texture_tile[tile].line_size_bytes);
-    uint32_t height = width > 0 ? sizeBytes / width : 0;
+    uint32_t naturalWidth = GetEffectiveLineSize(lineSizeBytes, fullImageLineSizeBytes, sizeBytes,
+                                                 mRdp->texture_tile[tile].line_size_bytes);
+    uint32_t height = naturalWidth > 0 ? sizeBytes / naturalWidth : 0;
 
     if (fullImageLineSizeBytes == sizeBytes) {
-        fullImageLineSizeBytes = width;
+        fullImageLineSizeBytes = naturalWidth;
     }
+
+    uint32_t width = ClampUploadWidthToTile(naturalWidth, mRdp->texture_tile[tile].uls,
+                                            mRdp->texture_tile[tile].lrs);
 
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
@@ -773,13 +1543,16 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
 
     uint32_t widthBytes = GetEffectiveLineSize(lineSizeBytes, fullImageLineSizeBytes, sizeBytes,
                                                mRdp->texture_tile[tile].line_size_bytes);
-    uint32_t width = widthBytes * 2;
+    uint32_t naturalWidth = widthBytes * 2;
     uint32_t height = widthBytes > 0 ? sizeBytes / widthBytes : 0;
 
     // A single line of pixels should not equal the entire image (height == 1 non-withstanding)
     if (fullImageLineSizeBytes == sizeBytes) {
-        fullImageLineSizeBytes = width / 2;
+        fullImageLineSizeBytes = naturalWidth / 2;
     }
+
+    uint32_t width = ClampUploadWidthToTile(naturalWidth, mRdp->texture_tile[tile].uls,
+                                            mRdp->texture_tile[tile].lrs);
 
     uint32_t i = 0;
 
@@ -894,6 +1667,29 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
         height = tile_h;
     }
 
+    // PORT: Clamp decoded width/height to the tile's `masks/maskt` wrap
+    // bounds if they're tighter than the line-derived width.  N64 hardware
+    // uses masks to define the "active" texture size, with the wrap mode
+    // repeating it beyond.  Fast3D's line_size_bytes-based width can be
+    // larger than the actual logical texture (e.g. a 16px-wide line with
+    // masks=3 = 8px-wide texture), so the trailing columns are padding
+    // whose indices decode to whatever's lying in TMEM — typically zero,
+    // yielding a half-black image for CI4 materials whose palette entry 0
+    // is opaque black.  Clamping width/height to the masks-based size
+    // matches the N64 sampler's behaviour and eliminates the black padding.
+    if (mRdp->texture_tile[tile].masks > 0) {
+        uint32_t mask_w = 1u << mRdp->texture_tile[tile].masks;
+        if (mask_w > 0 && mask_w < width) {
+            width = mask_w;
+        }
+    }
+    if (mRdp->texture_tile[tile].maskt > 0) {
+        uint32_t mask_h = 1u << mRdp->texture_tile[tile].maskt;
+        if (mask_h > 0 && mask_h < height) {
+            height = mask_h;
+        }
+    }
+
     if (fullImageLineSizeBytes == sizeBytes) {
         fullImageLineSizeBytes = resultLineSizeBytes;
     }
@@ -917,6 +1713,7 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
         }
     }
 
+    Ssb64RenderDiagLogUpload("CI4", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -943,22 +1740,15 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
         return;
     }
 
-    for (uint32_t i = 0, j = 0; i < sizeBytes; j += fullImageLineSizeBytes - lineSizeBytes) {
-        for (uint32_t k = 0; k < lineSizeBytes; i++, k++, j++) {
-            uint8_t idx = addr[j];
-            uint16_t col16 = (mRdp->palettes[idx / 128][(idx % 128) * 2] << 8) |
-                             mRdp->palettes[idx / 128][(idx % 128) * 2 + 1]; // Big endian load
-            uint8_t a = col16 & 1;
-            uint8_t r = col16 >> 11;
-            uint8_t g = (col16 >> 6) & 0x1f;
-            uint8_t b = (col16 >> 1) & 0x1f;
-            mTexUploadBuffer[4 * i + 0] = SCALE_5_8(r);
-            mTexUploadBuffer[4 * i + 1] = SCALE_5_8(g);
-            mTexUploadBuffer[4 * i + 2] = SCALE_5_8(b);
-            mTexUploadBuffer[4 * i + 3] = a ? 255 : 0;
-        }
-    }
-
+    // Compute width/height + clamps *before* decode so the decode loop
+    // produces a `width × height` packed buffer that matches the
+    // UploadTexture call below.  Previously the decode wrote
+    // `lineSizeBytes × (sizeBytes/lineSizeBytes)` pixels contiguously and
+    // the post-decode width clamp made the subsequent upload read rows at
+    // the wrong offset — diagonal shear across every CI8 sprite where
+    // `bitmap->width < bitmap->width_img` (e.g. the tutorial "How to Play"
+    // banner and the textbox).  Structurally mirrors the RGBA16 /
+    // ImportTextureCi4 paths.
     uint32_t baseLineSizeBytes = GetEffectiveLineSize(lineSizeBytes, fullImageLineSizeBytes, sizeBytes,
                                                       mRdp->texture_tile[tile].line_size_bytes);
     uint32_t resultLineSizeBytes = baseLineSizeBytes;
@@ -966,7 +1756,8 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
         resultLineSizeBytes *= metadata->h_byte_scale;
     }
 
-    uint32_t width = resultLineSizeBytes;
+    uint32_t naturalWidth = resultLineSizeBytes;
+    uint32_t width = naturalWidth;
     uint32_t height = resultLineSizeBytes > 0 ? sizeBytes / resultLineSizeBytes : 0;
 
     // Clamp to tile dimensions from SetTileSize
@@ -979,6 +1770,46 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
         height = tile_h;
     }
 
+    // PORT: clamp to masks/maskt wrap bounds. See ImportTextureCi4 for rationale.
+    if (mRdp->texture_tile[tile].masks > 0) {
+        uint32_t mask_w = 1u << mRdp->texture_tile[tile].masks;
+        if (mask_w > 0 && mask_w < width) {
+            width = mask_w;
+        }
+    }
+    if (mRdp->texture_tile[tile].maskt > 0) {
+        uint32_t mask_h = 1u << mRdp->texture_tile[tile].maskt;
+        if (mask_h > 0 && mask_h < height) {
+            height = mask_h;
+        }
+    }
+
+    // Flat-LoadBlock fallback: the real DRAM row stride is naturalWidth
+    // bytes (CI8 = 1 byte per texel), not the whole image.  Matches
+    // ImportTextureCi4 / ImportTextureRgba16.
+    if (fullImageLineSizeBytes == sizeBytes) {
+        fullImageLineSizeBytes = naturalWidth;
+    }
+
+    uint32_t i = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+            uint8_t idx = addr[y * fullImageLineSizeBytes + x];
+            uint16_t col16 = (mRdp->palettes[idx / 128][(idx % 128) * 2] << 8) |
+                             mRdp->palettes[idx / 128][(idx % 128) * 2 + 1]; // Big endian load
+            uint8_t a = col16 & 1;
+            uint8_t r = col16 >> 11;
+            uint8_t g = (col16 >> 6) & 0x1f;
+            uint8_t b = (col16 >> 1) & 0x1f;
+            mTexUploadBuffer[4 * i + 0] = SCALE_5_8(r);
+            mTexUploadBuffer[4 * i + 1] = SCALE_5_8(g);
+            mTexUploadBuffer[4 * i + 2] = SCALE_5_8(b);
+            mTexUploadBuffer[4 * i + 3] = a ? 255 : 0;
+            i++;
+        }
+    }
+
+    Ssb64RenderDiagLogUpload("CI8", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -996,6 +1827,7 @@ void Interpreter::ImportTextureImg(int tile, bool importReplacement) {
 
     uint16_t width = metadata->width;
     uint16_t height = metadata->height;
+    Ssb64RenderDiagLogUpload("IMG", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
     mRapi->UploadTexture(addr, width, height);
 }
 
@@ -1043,6 +1875,7 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
 
     if (resultNewLineSize == 4 * width && resultNewHeight == height) {
         // Can use the texture directly since it has the correct dimensions
+        Ssb64RenderDiagLogUpload("RAW-direct", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index, width, height);
         mRapi->UploadTexture(addr, width, height);
         return;
     }
@@ -1076,6 +1909,8 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
         memset(mTexUploadBuffer + resourceImageSizeBytes, 0, numLoadedBytes - resourceImageSizeBytes);
     }
 
+    Ssb64RenderDiagLogUpload("RAW-copy", metadata, addr, tile, mRdp->texture_tile[tile].tmem_index,
+                             resultNewLineSize / 4, resultNewHeight);
     mRapi->UploadTexture(mTexUploadBuffer, resultNewLineSize / 4, resultNewHeight);
 }
 
@@ -1086,6 +1921,10 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     uint32_t tmemIdex = mRdp->texture_tile[tile].tmem_index;
     uint8_t paletteIndex = mRdp->texture_tile[tile].palette;
     uint32_t origSizeBytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes;
+    uint16_t tileWidth =
+        (uint16_t)(int32_t)((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
+    uint16_t tileHeight =
+        (uint16_t)(int32_t)((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
 
     // Check TLUT mode early -- before cache lookup -- so the fmt override
     // affects both the cache key and the decode path.
@@ -1118,6 +1957,85 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         texFlags = mRdp->loaded_texture[otherTmem].tex_flags;
     }
 
+    // FB-texture passthrough: if the caller has registered a range that
+    // contains this CPU address as a mirror of a GPU framebuffer
+    // (port_capture_register_fb_for_subrect), bypass the CPU decode/upload
+    // path and bind the FB directly via SelectTextureFb. Also stash the
+    // registration's source-FB UV sub-rect into mFbUvTransform[i] so
+    // GfxSpTri1 can remap the consumer's local UV (0..1) to the right
+    // slice of the bigger FB -- without this, a multi-tile sprite (TMEM is
+    // 4 KB, FB-sized region must be tiled) would render every tile sampling
+    // the WHOLE FB.
+    //
+    // On a miss, reset the transform to identity so a previous hit's
+    // sub-rect doesn't leak into a fresh non-FB binding on this tile slot.
+    //
+    // Skipped for replacement uploads -- those go through the masked-texture path.
+    if (i >= 0 && i < 2) {
+        mFbUvTransform[i] = FbUvTransform{ 1.0f, 1.0f, 0.0f, 0.0f };
+    }
+    if (!importReplacement && !mFbTextures.empty()) {
+        uintptr_t a = reinterpret_cast<uintptr_t>(origAddr);
+        auto it = mFbTextures.upper_bound(a); // first base > a
+        if (it != mFbTextures.begin()) {
+            --it; // last base <= a
+            if (a < it->second.end) {
+                Flush();
+                mRapi->SelectTextureFb(it->second.fbId);
+                if (i >= 0 && i < 2) {
+                    const FbTextureRange& r = it->second;
+
+                    /* Per-call UV slice: one registration can cover an entire
+                     * tiled image (N64 TMEM is 4 KB so any FB-sized texture
+                     * is sampled as N stripes via N gsDPSetTextureImage +
+                     * LoadBlock cycles, each with its own offset). The hook
+                     * uses the stride and load-size that the prior LoadBlock
+                     * already stashed into loaded_texture to figure out which
+                     * vertical slice of the registered FB sub-rect this call
+                     * represents.
+                     *
+                     * For the trivial single-tile case (one big SetTextureImage
+                     * at base, one LoadBlock that covers the whole range) the
+                     * math degenerates to the registered (u0,v0,u1,v1) verbatim. */
+                    uint32_t lineBytes = mRdp->loaded_texture[tmemIdex].line_size_bytes;
+                    uint32_t loadBytes = mRdp->loaded_texture[tmemIdex].size_bytes;
+                    uintptr_t totalBytes = r.end - it->first;
+                    float v0Slice = r.v0;
+                    float v1Slice = r.v1;
+                    if (lineBytes > 0 && loadBytes >= lineBytes && totalBytes >= lineBytes) {
+                        uintptr_t totalRows = totalBytes / lineBytes;
+                        uintptr_t offBytes = a - it->first;
+                        uintptr_t offRows = offBytes / lineBytes;
+                        uintptr_t loadRows = loadBytes / lineBytes;
+                        if (totalRows > 0 && offRows + loadRows <= totalRows) {
+                            float vRange = r.v1 - r.v0;
+                            float invTotal = 1.0f / (float)totalRows;
+                            v0Slice = r.v0 + (float)offRows * invTotal * vRange;
+                            v1Slice = r.v0 + (float)(offRows + loadRows) * invTotal * vRange;
+                        }
+                    }
+
+                    mFbUvTransform[i] = FbUvTransform{
+                        r.u1 - r.u0, v1Slice - v0Slice,
+                        r.u0,        v0Slice
+                    };
+                    // Backends whose FB-as-texture sample direction is
+                    // opposite of their FB render direction (OpenGL with
+                    // invertY=true) need a V-flip applied here so consumer
+                    // UVs remain consistent across backends. D3D11 and Metal
+                    // return false from FbNeedsSampleVFlip, so this is a
+                    // no-op there.
+                    if (mRapi->FbNeedsSampleVFlip(it->second.fbId)) {
+                        mFbUvTransform[i].scaleV = -mFbUvTransform[i].scaleV;
+                        mFbUvTransform[i].offsetV = 1.0f - mFbUvTransform[i].offsetV;
+                    }
+                }
+                mRdp->textures_changed[i] = false;
+                return;
+            }
+        }
+    }
+
     // Use palette_dram_addr (the original DRAM source) instead of palettes[]
     // (which always points to the staging buffer) so the same texture drawn
     // with different palettes gets distinct cache entries.
@@ -1131,19 +2049,56 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
                     fmt,
                     siz,
                     paletteIndex,
-                    origSizeBytes };
+                    origSizeBytes,
+                    mRdp->texture_tile[tile].masks,
+                    mRdp->texture_tile[tile].maskt,
+                    tileWidth,
+                    tileHeight };
         } else {
             // CI8 uses both palette halves
             key = { origAddr,     { mRdp->palette_dram_addr[0], mRdp->palette_dram_addr[1] }, fmt, siz, paletteIndex,
-                    origSizeBytes };
+                    origSizeBytes, mRdp->texture_tile[tile].masks, mRdp->texture_tile[tile].maskt, tileWidth,
+                    tileHeight };
         }
     } else {
-        key = { origAddr, {}, fmt, siz, paletteIndex, origSizeBytes };
+        key = { origAddr, {}, fmt, siz, paletteIndex, origSizeBytes, mRdp->texture_tile[tile].masks,
+                mRdp->texture_tile[tile].maskt, tileWidth, tileHeight };
     }
 
+    Ssb64RenderDiagLogImport("import", metadata, origAddr, i, tile, tmemIdex, fmt, siz, mRdp->texture_tile[tile].cms,
+                             mRdp->texture_tile[tile].cmt, mRdp->texture_tile[tile].masks,
+                             mRdp->texture_tile[tile].maskt, mRdp->texture_tile[tile].shifts,
+                             mRdp->texture_tile[tile].shiftt, mRdp->texture_tile[tile].line_size_bytes,
+                             mRdp->loaded_texture[tmemIdex].line_size_bytes,
+                             mRdp->loaded_texture[tmemIdex].full_image_line_size_bytes,
+                             mRdp->loaded_texture[tmemIdex].size_bytes, origSizeBytes, mRdp->texture_tile[tile].uls,
+                             mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrs, mRdp->texture_tile[tile].lrt,
+                             importReplacement);
+
     if (TextureCacheLookup(i, key)) {
+        Ssb64RenderDiagLogImport("cache-hit", metadata, origAddr, i, tile, tmemIdex, fmt, siz,
+                                 mRdp->texture_tile[tile].cms, mRdp->texture_tile[tile].cmt,
+                                 mRdp->texture_tile[tile].masks, mRdp->texture_tile[tile].maskt,
+                                 mRdp->texture_tile[tile].shifts, mRdp->texture_tile[tile].shiftt,
+                                 mRdp->texture_tile[tile].line_size_bytes,
+                                 mRdp->loaded_texture[tmemIdex].line_size_bytes,
+                                 mRdp->loaded_texture[tmemIdex].full_image_line_size_bytes,
+                                 mRdp->loaded_texture[tmemIdex].size_bytes, origSizeBytes,
+                                 mRdp->texture_tile[tile].uls, mRdp->texture_tile[tile].ult,
+                                 mRdp->texture_tile[tile].lrs, mRdp->texture_tile[tile].lrt, importReplacement);
         return;
     }
+
+    Ssb64RenderDiagLogImport("cache-miss", metadata, origAddr, i, tile, tmemIdex, fmt, siz,
+                             mRdp->texture_tile[tile].cms, mRdp->texture_tile[tile].cmt,
+                             mRdp->texture_tile[tile].masks, mRdp->texture_tile[tile].maskt,
+                             mRdp->texture_tile[tile].shifts, mRdp->texture_tile[tile].shiftt,
+                             mRdp->texture_tile[tile].line_size_bytes,
+                             mRdp->loaded_texture[tmemIdex].line_size_bytes,
+                             mRdp->loaded_texture[tmemIdex].full_image_line_size_bytes,
+                             mRdp->loaded_texture[tmemIdex].size_bytes, origSizeBytes, mRdp->texture_tile[tile].uls,
+                             mRdp->texture_tile[tile].ult, mRdp->texture_tile[tile].lrs, mRdp->texture_tile[tile].lrt,
+                             importReplacement);
 
     // Guard against zero-sized textures that would cause divide-by-zero
     // or GPU API errors in UploadTexture.
@@ -1170,9 +2125,16 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
             } else if (siz == G_IM_SIZ_32b) {
                 ImportTextureRgba32(tile, importReplacement);
             } else {
-                SPDLOG_ERROR("RGBA Texture that isn't 16 or 32 bit. Size = {}", siz);
-                // OTRTODO: Sometimes, seemingly randomly, we end up here. Could be a bad dlist, could be
-                // something F3D does not have supported. Further investigation is needed.
+                static int sRgbaErrLogCount = 0;
+                if (sRgbaErrLogCount < 40) {
+                    SPDLOG_ERROR("RGBA Texture invalid siz={} tile={} fmt={} addr={} line={} width={} height={} palette={} origSize={}",
+                        siz, tile, fmt, (const void *)origAddr,
+                        mRdp->texture_tile[tile].line_size_bytes,
+                        mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 1,
+                        mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 1,
+                        paletteIndex, origSizeBytes);
+                    sRgbaErrLogCount++;
+                }
             }
             break;
         case G_IM_FMT_IA:
@@ -1183,8 +2145,7 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
             } else if (siz == G_IM_SIZ_16b) {
                 ImportTextureIA16(tile, importReplacement);
             } else {
-                SPDLOG_ERROR("IA Texture that isn't 4, 8, or 16 bit. Size = {}", siz);
-                ;
+                SPDLOG_ERROR("IA Texture invalid siz={} tile={}", siz, tile);
             }
             break;
         case G_IM_FMT_CI:
@@ -1239,7 +2200,7 @@ void Interpreter::ImportTextureMask(int i, int tile) {
         return;
     }
 
-    TextureCacheKey key = { orig_addr, {}, 0, 0, 0, 0 };
+    TextureCacheKey key = { orig_addr, {}, 0, 0, 0, 0, 0, 0, 0, 0 };
 
     if (TextureCacheLookup(i, key)) {
         return;
@@ -1382,12 +2343,38 @@ void Interpreter::GfxSpPopMatrix(uint32_t count) {
     mRsp->lights_changed = true;
 }
 
+float Interpreter::GetWidescreenClipXScale() const {
+    // SSB64 port: gated on the port-managed mWidescreenActive flag (set by
+    // port/widescreen/widescreen.cpp from the gEnhancements.Widescreen CVar).
+    // When off, returns 1.0f and 4:3 GBI stretches to fill the window
+    // (matching pre-widescreen-feature behavior). When on, returns
+    // (4/3)/window_aspect so callers can compress post-projection clip-space
+    // X — expanding the visible 4:3 frustum into the wider window. Reads the
+    // OS window aspect from mGameWindowViewport rather than mCurDimensions
+    // because the latter can be forced to 4:3 by the Advanced Resolution
+    // CVar tree (which the SSB64 port also uses for the CVar-off-default 4:3
+    // pillarbox); mGameWindowViewport always reflects the actual SDL window
+    // size.
+    if (!mWidescreenActive) {
+        return 1.0f;
+    }
+    const float win_w = (float)mGameWindowViewport.width;
+    const float win_h = (float)mGameWindowViewport.height;
+    if (win_w <= 0.0f || win_h <= 0.0f) {
+        return 1.0f;
+    }
+    const float win_aspect = win_w / win_h;
+    if (win_aspect <= (4.0f / 3.0f)) {
+        return 1.0f;
+    }
+    return (4.0f / 3.0f) / win_aspect;
+}
+
 float Interpreter::AdjXForAspectRatio(float x) const {
     if (mFbActive) {
         return x;
-    } else {
-        return x * (4.0f / 3.0f) / ((float)mCurDimensions.width / (float)mCurDimensions.height);
     }
+    return x * GetWidescreenClipXScale();
 }
 
 // Scale the width and height value based on the ratio of the viewport to the native size
@@ -1657,6 +2644,22 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     bool depth_test = (mRsp->geometry_mode & G_ZBUFFER) == G_ZBUFFER;
     bool depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
+    // PORT: SSB64's mvOpeningRoom transition Overlay/Outline use the N64
+    // "redirect color image to Z buffer" idiom: tris are drawn with G_ZBUFFER
+    // set in geometry_mode but no Z_CMP/Z_UPD in render mode, so on real
+    // hardware they bypass depth comparison and write into the ZB as if it
+    // were a colour buffer. Fast3D ignores the colour-image redirect (so
+    // those tris land on the primary FB instead) and also derives
+    // depth_test from G_ZBUFFER alone — which Z-rejects them against the
+    // stale ZB content from the previous scene draw, making the explosion
+    // sprite invisible. When the redirect is active, gate depth_test on
+    // Z_CMP from other_mode_l (real-hardware semantics) so the Overlay's
+    // white tris reach the framebuffer.
+    bool redirect_active = mRdp->color_image_address == mRdp->z_buf_address && mRdp->color_image_address != nullptr;
+    if (redirect_active) {
+        depth_test = (mRdp->other_mode_l & Z_CMP) == Z_CMP;
+        depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
+    }
     uint8_t depth_test_and_mask = (depth_test ? 1 : 0) | (depth_mask ? 2 : 0);
     if (depth_test_and_mask != mRenderingState.depth_test_and_mask) {
         Flush();
@@ -1757,6 +2760,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     ColorCombinerKey key;
     key.combine_mode = mRdp->combine_mode;
     key.options = cc_options;
+    key.shader_id = 0;
 
     ColorCombiner* comb = LookupOrCreateColorCombiner(key);
 
@@ -1838,6 +2842,25 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 tex_height[i] = tex_height2[i];
             }
 
+            // Keep UV normalization in lockstep with the importers that shrink padded TMEM rows to mask bounds.
+            bool uploadClampsToMask =
+                ((mRdp->texture_tile[tile].fmt == G_IM_FMT_RGBA || mRdp->texture_tile[tile].fmt == G_IM_FMT_CI) &&
+                 mRdp->texture_tile[tile].siz == G_IM_SIZ_16b) ||
+                (mRdp->texture_tile[tile].fmt == G_IM_FMT_CI &&
+                 (mRdp->texture_tile[tile].siz == G_IM_SIZ_4b || mRdp->texture_tile[tile].siz == G_IM_SIZ_8b));
+            if (uploadClampsToMask && mRdp->texture_tile[tile].masks > 0) {
+                uint32_t maskWidth = 1u << mRdp->texture_tile[tile].masks;
+                if (maskWidth > 0 && maskWidth < tex_width[i]) {
+                    tex_width[i] = maskWidth;
+                }
+            }
+            if (uploadClampsToMask && mRdp->texture_tile[tile].maskt > 0) {
+                uint32_t maskHeight = 1u << mRdp->texture_tile[tile].maskt;
+                if (maskHeight > 0 && maskHeight < tex_height[i]) {
+                    tex_height[i] = maskHeight;
+                }
+            }
+
             uint32_t tex_width1 = tex_width[i] << (cms & G_TX_MIRROR);
             uint32_t tex_height1 = tex_height[i] << (cmt & G_TX_MIRROR);
 
@@ -1877,6 +2900,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         comb->prg[tm] = prg =
             LookupOrCreateShaderProgram(comb->shader_id0, comb->shader_id1 | tm * SHADER_OPT(TEXEL0_CLAMP_S));
     }
+    if (prg == NULL) {
+        return; // Shader compile failed — skip this draw call
+    }
     if (prg != mRenderingState.mShaderProgram) {
         Flush();
         mRapi->UnloadShader(mRenderingState.mShaderProgram);
@@ -1895,9 +2921,105 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
 
+    // PORT: G_ZS_PRIM source overrides per-vertex Z with the constant Z set by
+    // gDPSetPrimDepth. SSB64 (and many other N64 titles) use this to place 2D
+    // sprites at a specific Z-buffer depth so subsequent 3D geometry layers
+    // correctly. We map the 16-bit N64 Z linearly to clip-space Z; combined with
+    // the per-API z_is_from_0_to_1 flag this lands the sprite at the intended
+    // depth on both Metal/D3D ([0,1]) and OpenGL ([-1,1]). dz is ignored — the
+    // depth-slope is irrelevant once we're producing post-projection Z directly.
+    bool use_prim_depth = (mRdp->other_mode_l & G_ZS_PRIM) == G_ZS_PRIM;
+    float prim_depth_ndc = (float)mRdp->prim_depth_z / 65535.0f; // 0..1 (Metal-style)
+    if (!clip_parameters.z_is_from_0_to_1) {
+        prim_depth_ndc = prim_depth_ndc * 2.0f - 1.0f; // OpenGL [-1,1]
+    }
+
+    for (int t = 0; t < 2; t++) {
+        if (!usedTextures[t] || tex_width[t] == 0 || tex_height[t] == 0) {
+            continue;
+        }
+
+        uint32_t uv_tile = effective_tile[t];
+        uint32_t tmemIndex = mRdp->texture_tile[uv_tile].tmem_index;
+        const RawTexMetadata* metadata = &mRdp->loaded_texture[tmemIndex].raw_tex_metadata;
+        const void* addr = mRdp->loaded_texture[tmemIndex].addr;
+        float rawUMin = 0.0f;
+        float rawUMax = 0.0f;
+        float rawVMin = 0.0f;
+        float rawVMax = 0.0f;
+        float normUMin = 0.0f;
+        float normUMax = 0.0f;
+        float normVMin = 0.0f;
+        float normVMax = 0.0f;
+
+        for (int vi = 0; vi < 3; vi++) {
+            float rawU = v_arr[vi]->u / 32.0f;
+            float rawV = v_arr[vi]->v / 32.0f;
+            float u = rawU;
+            float v = rawV;
+
+            int shifts = mRdp->texture_tile[uv_tile].shifts;
+            int shiftt = mRdp->texture_tile[uv_tile].shiftt;
+            if (shifts != 0) {
+                if (shifts <= 10) {
+                    u /= 1 << shifts;
+                } else {
+                    u *= 1 << (16 - shifts);
+                }
+            }
+            if (shiftt != 0) {
+                if (shiftt <= 10) {
+                    v /= 1 << shiftt;
+                } else {
+                    v *= 1 << (16 - shiftt);
+                }
+            }
+
+            u -= mRdp->texture_tile[uv_tile].uls / 4.0f;
+            v -= mRdp->texture_tile[uv_tile].ult / 4.0f;
+
+            if ((mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT && !is_rect) {
+                u += 0.5f;
+                v += 0.5f;
+            }
+
+            float normU = u / tex_width[t];
+            float normV = v / tex_height[t];
+
+            if (vi == 0) {
+                rawUMin = rawUMax = rawU;
+                rawVMin = rawVMax = rawV;
+                normUMin = normUMax = normU;
+                normVMin = normVMax = normV;
+            } else {
+                rawUMin = rawU < rawUMin ? rawU : rawUMin;
+                rawUMax = rawU > rawUMax ? rawU : rawUMax;
+                rawVMin = rawV < rawVMin ? rawV : rawVMin;
+                rawVMax = rawV > rawVMax ? rawV : rawVMax;
+                normUMin = normU < normUMin ? normU : normUMin;
+                normUMax = normU > normUMax ? normU : normUMax;
+                normVMin = normV < normVMin ? normV : normVMin;
+                normVMax = normV > normVMax ? normV : normVMax;
+            }
+        }
+
+        Ssb64RenderDiagLogDraw(metadata, addr, t, uv_tile, tmemIndex, mRdp->texture_tile[uv_tile].fmt,
+                               mRdp->texture_tile[uv_tile].siz, mRdp->texture_tile[uv_tile].cms,
+                               mRdp->texture_tile[uv_tile].cmt, mRdp->texture_tile[uv_tile].masks,
+                               mRdp->texture_tile[uv_tile].maskt, mRdp->texture_tile[uv_tile].shifts,
+                               mRdp->texture_tile[uv_tile].shiftt, tex_width[t], tex_height[t], tex_width2[t],
+                               tex_height2[t], rawUMin, rawUMax, rawVMin, rawVMax, normUMin, normUMax, normVMin,
+                               normVMax, v_arr[0]->x, v_arr[0]->y, v_arr[0]->z, v_arr[0]->w, v_arr[1]->x,
+                               v_arr[1]->y, v_arr[1]->z, v_arr[1]->w, v_arr[2]->x, v_arr[2]->y, v_arr[2]->z,
+                               v_arr[2]->w);
+    }
+
     for (int i = 0; i < 3; i++) {
         float z = v_arr[i]->z, w = v_arr[i]->w;
-        if (clip_parameters.z_is_from_0_to_1) {
+        if (use_prim_depth) {
+            // Multiply by w so the Metal/GL perspective divide produces prim_depth_ndc.
+            z = prim_depth_ndc * w;
+        } else if (clip_parameters.z_is_from_0_to_1) {
             z = (z + w) / 2.0f;
         }
 
@@ -1942,18 +3064,28 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 }
             }
 
-            mBufVbo[mBufVboLen++] = u / tex_width[t];
-            mBufVbo[mBufVboLen++] = v / tex_height[t];
+            // Apply the FB-mirror UV transform (identity unless the bound
+            // texture is a registered sub-rect of a snapshot FB). This remaps
+            // a tile's local UV (0..1) into the FB sub-rect [u0,u1] x [v0,v1]
+            // so a multi-tile sprite samples its slice of the captured frame
+            // instead of the whole thing.
+            const FbUvTransform& xf = mFbUvTransform[t];
+            float normU = u / tex_width[t];
+            float normV = v / tex_height[t];
+            mBufVbo[mBufVboLen++] = normU * xf.scaleU + xf.offsetU;
+            mBufVbo[mBufVboLen++] = normV * xf.scaleV + xf.offsetV;
 
             bool clampS = tm & (1 << 2 * t);
             bool clampT = tm & (1 << 2 * t + 1);
 
             if (clampS) {
-                mBufVbo[mBufVboLen++] = (tex_width2[t] - 0.5f) / tex_width[t];
+                float clampNormU = (tex_width2[t] - 0.5f) / tex_width[t];
+                mBufVbo[mBufVboLen++] = clampNormU * xf.scaleU + xf.offsetU;
             }
 
             if (clampT) {
-                mBufVbo[mBufVboLen++] = (tex_height2[t] - 0.5f) / tex_height[t];
+                float clampNormV = (tex_height2[t] - 0.5f) / tex_height[t];
+                mBufVbo[mBufVboLen++] = clampNormV * xf.scaleV + xf.offsetV;
             }
         }
 
@@ -1968,7 +3100,17 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.r / 255.0f;
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.g / 255.0f;
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.b / 255.0f;
-                mBufVbo[mBufVboLen++] = v_arr[i]->color.a / 255.0f; // fog factor (not alpha)
+                // Cycle-1 alpha-source mux (other_mode_l bits 26..27): G_BL_A_FOG (1) means
+                // the blender's alpha comes from the fog color register itself; G_BL_A_SHADE
+                // (2, default for OoT-style depth fog) means per-vertex shade alpha (which the
+                // RSP fills with the depth-based fog factor when G_FOG geomode is on).
+                // Without this branch, G_RM_FOG_PRIM_A degenerates to vertex alpha and the
+                // game's intended SetFogColor.a tint is lost (e.g. SSB64 respawn-platform
+                // white flash, fighter hit/F-Smash colour flashes).
+                uint8_t fog_alpha_src = (mRdp->other_mode_l >> 26) & 3;
+                float fog_a = (fog_alpha_src == G_BL_A_FOG) ? mRdp->fog_color.a / 255.0f
+                                                            : v_arr[i]->color.a / 255.0f;
+                mBufVbo[mBufVboLen++] = fog_a;
             }
         }
 
@@ -2171,20 +3313,127 @@ void Interpreter::GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t 
             mRsp->current_num_lights = data / 24 + 1; // add ambient light
             mRsp->lights_changed = true;
             break;
+        case G_MW_LIGHTCOL: {
+            // gSPLightColor(pkt, n, col) expands to two gMoveWd(G_MW_LIGHTCOL)
+            // commands: one at offset aLIGHT_n (populates light.l.col) and one
+            // at offset bLIGHT_n (populates light.l.colc).  For F3DEX2 the
+            // light slots are 24 bytes apart (aLIGHT_1=0, bLIGHT_1=4,
+            // aLIGHT_2=0x18, bLIGHT_2=0x1C, aLIGHT_3=0x30, ...).
+            //
+            // Without this case the command was a no-op, so per-material
+            // light color overrides (e.g. SSB64's fighters) never reached the
+            // RSP and every lit material rendered with whatever stale light
+            // the RSP last held — typically the scene-default white from
+            // ftDisplayLightsDrawReflect.
+            //
+            // `data` carries an N64-format packcol where R/G/B occupy the top
+            // three bytes: (r << 24) | (g << 16) | (b << 8) | a.  This is the
+            // same byte layout the F3DLight_t struct uses in DMEM, so we
+            // write directly into col/colc.
+            const int light_idx = offset / 24;   // 0-based light slot
+            const bool is_b = (offset & 4) != 0; // bLIGHT (colc) vs aLIGHT (col)
+            if (light_idx >= 0 && light_idx <= MAX_LIGHTS) {
+                F3DLight& light = mRsp->current_lights[light_idx];
+                uint8_t r = (uint8_t)(data >> 24);
+                uint8_t g = (uint8_t)(data >> 16);
+                uint8_t b = (uint8_t)(data >> 8);
+                if (is_b) {
+                    light.l.colc[0] = r;
+                    light.l.colc[1] = g;
+                    light.l.colc[2] = b;
+                } else {
+                    light.l.col[0] = r;
+                    light.l.col[1] = g;
+                    light.l.col[2] = b;
+                }
+                mRsp->lights_changed = true;
+            }
+        } break;
         case G_MW_FOG:
             mRsp->fog_mul = (int16_t)(data >> 16);
             mRsp->fog_offset = (int16_t)data;
             break;
         case G_MW_SEGMENT: {
             int segNumber = offset / 4;
+#ifdef PORT_DIAG_HAVE_ASAN
+            uintptr_t _old = mSegmentPointers[segNumber];
+#endif
             mSegmentPointers[segNumber] = data;
+#ifdef PORT_DIAG_HAVE_ASAN
+            diagRecordSegWrite(segNumber, _old, data, "MovewordF3dex2/G_MW_SEGMENT", 0);
+#endif
         } break;
         case G_MW_SEGMENT_INTERP: {
             int segNumber = offset % 16;
             int segIndex = offset / 16;
 
-            if (segIndex == mInterpolationIndex)
+            if (segIndex == mInterpolationIndex) {
+#ifdef PORT_DIAG_HAVE_ASAN
+                uintptr_t _old = mSegmentPointers[segNumber];
+#endif
                 mSegmentPointers[segNumber] = data;
+#ifdef PORT_DIAG_HAVE_ASAN
+                diagRecordSegWrite(segNumber, _old, data, "MovewordF3dex2/G_MW_SEGMENT_INTERP", 0);
+#endif
+            }
+        } break;
+        case G_MW_MATRIX: {
+            // SSB64 (and other titles using draw types that build custom MVPs)
+            // emits gSPMvpRecalc + a sequence of gMoveWd(G_MW_MATRIX, ...) to
+            // patch individual integer/fractional halves of the RSP's MVP
+            // matrix in flight.  On N64 these write directly into the matrix
+            // DMEM slots; the next vertex transform reads the patched MVP.
+            //
+            // Fast3D keeps MP_matrix recomputed eagerly in GfxSpMatrix, so we
+            // emulate the patches by decomposing the relevant float entries
+            // back into the s15.16 fixed-point pair, overwriting just the
+            // half the gMoveWd targets, and recomposing.  The next G_MTX call
+            // will overwrite MP_matrix from M*P again, wiping the patches —
+            // same as the N64 hardware.
+            //
+            // Layout (mirrors GfxSpMatrix decoder above):
+            //   bytes 0x00..0x1F = integer halves, 8 u32 entries
+            //   bytes 0x20..0x3F = fractional halves, 8 u32 entries
+            //   each u32 packs two adjacent matrix elements in the same row:
+            //     high16 = m[row][col_a] half, low16 = m[row][col_b] half
+            //   slot index = (offset & 0x1F) / 4
+            //   row = slot / 2, col_a = (slot % 2) * 2, col_b = col_a + 1
+            const bool is_frac = (offset & 0x20) != 0;
+            const int slot = (offset & 0x1F) >> 2; // 0..7
+            const int row = slot >> 1;
+            const int col_a = (slot & 1) << 1;
+            const int col_b = col_a + 1;
+            const uint32_t v = (uint32_t)data;
+
+            auto encode = [](float f) -> int32_t {
+                return (int32_t)lrintf(f * 65536.0f);
+            };
+            auto decode = [](int32_t fx) -> float {
+                return (float)fx * (1.0f / 65536.0f);
+            };
+
+            int32_t fx_a = encode(mRsp->MP_matrix[row][col_a]);
+            int32_t fx_b = encode(mRsp->MP_matrix[row][col_b]);
+
+            const uint16_t new_a = (uint16_t)(v >> 16);
+            const uint16_t new_b = (uint16_t)(v & 0xFFFF);
+
+            // Replace half of each fixed-point pair without disturbing the
+            // other half.  All math is done as uint32_t to avoid signed-shift
+            // UB; the final cast back to int32_t reinterprets bit 31 as the
+            // sign of the s15.16 value, matching the existing decoder.
+            const uint32_t fx_a_u = (uint32_t)fx_a;
+            const uint32_t fx_b_u = (uint32_t)fx_b;
+            if (is_frac) {
+                fx_a = (int32_t)((fx_a_u & 0xFFFF0000u) | new_a);
+                fx_b = (int32_t)((fx_b_u & 0xFFFF0000u) | new_b);
+            } else {
+                fx_a = (int32_t)(((uint32_t)new_a << 16) | (fx_a_u & 0xFFFFu));
+                fx_b = (int32_t)(((uint32_t)new_b << 16) | (fx_b_u & 0xFFFFu));
+            }
+
+            mRsp->MP_matrix[row][col_a] = decode(fx_a);
+            mRsp->MP_matrix[row][col_b] = decode(fx_b);
         } break;
     }
 }
@@ -2203,14 +3452,27 @@ void Interpreter::GfxSpMovewordF3d(uint8_t index, uint16_t offset, uintptr_t dat
             break;
         case G_MW_SEGMENT: {
             int segNumber = offset / 4;
+#ifdef PORT_DIAG_HAVE_ASAN
+            uintptr_t _old = mSegmentPointers[segNumber];
+#endif
             mSegmentPointers[segNumber] = data;
+#ifdef PORT_DIAG_HAVE_ASAN
+            diagRecordSegWrite(segNumber, _old, data, "MovewordF3d/G_MW_SEGMENT", 0);
+#endif
         } break;
         case G_MW_SEGMENT_INTERP: {
             int segNumber = offset % 16;
             int segIndex = offset / 16;
 
-            if (segIndex == mInterpolationIndex)
+            if (segIndex == mInterpolationIndex) {
+#ifdef PORT_DIAG_HAVE_ASAN
+                uintptr_t _old = mSegmentPointers[segNumber];
+#endif
                 mSegmentPointers[segNumber] = data;
+#ifdef PORT_DIAG_HAVE_ASAN
+                diagRecordSegWrite(segNumber, _old, data, "MovewordF3d/G_MW_SEGMENT_INTERP", 0);
+#endif
+            }
         } break;
     }
 }
@@ -2238,6 +3500,28 @@ void Interpreter::GfxDpSetScissor(uint32_t mode, uint32_t ulx, uint32_t uly, uin
     mRdp->scissor.height = height;
 
     AdjustVIewportOrScissor(&mRdp->scissor);
+
+    // SSB64 port: when the tight-4:3-scissor hook is active alongside
+    // widescreen, narrow the GPU scissor to the centered 4:3 sub-region of
+    // the wider FB. Game code flips this for scene-specific effects whose
+    // mesh geometry would otherwise show perspective slants beyond the 4:3
+    // crop (e.g. OpeningRun impact-flash starburst).
+    if (mWidescreenActive && mTight4_3ScissorWindow && !mFbActive) {
+        const float win_w = (float)mGameWindowViewport.width;
+        const float win_h = (float)mGameWindowViewport.height;
+        if (win_w > 0.0f && win_h > 0.0f) {
+            const float win_aspect = win_w / win_h;
+            const float base_aspect = 4.0f / 3.0f;
+            if (win_aspect > base_aspect) {
+                const float target_w = mRdp->scissor.height * base_aspect;
+                const float margin = (mRdp->scissor.width - target_w) * 0.5f;
+                if (margin > 0.0f) {
+                    mRdp->scissor.x += margin;
+                    mRdp->scissor.width = target_w;
+                }
+            }
+        }
+    }
 
     mRdp->viewport_or_scissor_changed = true;
 }
@@ -2273,6 +3557,8 @@ void Interpreter::GfxDpSetTile(uint8_t fmt, uint32_t siz, uint32_t line, uint32_
     mRdp->texture_tile[tile].cmt = cmt;
     mRdp->texture_tile[tile].shifts = shifts;
     mRdp->texture_tile[tile].shiftt = shiftt;
+    mRdp->texture_tile[tile].masks = (uint8_t)masks;
+    mRdp->texture_tile[tile].maskt = (uint8_t)maskt;
     mRdp->texture_tile[tile].line_size_bytes = line * 8;
 
     mRdp->texture_tile[tile].tmem = tmem;
@@ -2299,15 +3585,37 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
 
     uint16_t tmem = mRdp->texture_tile[tile].tmem;
     const uint8_t* src = mRdp->texture_to_load.addr;
+    if (src == nullptr) {
+        SPDLOG_ERROR("GfxDpLoadTlut: missing texture image for tile {}", tile);
+        return;
+    }
     uint32_t entryCount = high_index + 1;
     uint32_t byteCount = entryCount * 2;
+
+    // PORT (issue #4): N64 RDP transfers DMA in 8-byte (qword) chunks, so a
+    // LOADTLUT with high_index_plus_one*2 not a multiple of 8 still pulls a
+    // full 8-byte qword from DRAM into TMEM. Game DLs lean on this: e.g.
+    // Mario's BTT arrow uses count=3 (6 bytes) and samples palette[3] in its
+    // image, expecting the 4th palette entry sitting at src+6..7 to also be
+    // loaded. libultraship's exact-byteCount memcpy left palette[3] as stale
+    // bytes from the previous LOADTLUT, manifesting as the per-character
+    // "blue inside the chevron" bug after the count=3 outline was already
+    // black. Round byteCount up to 8 bytes to match N64 DMA semantics.
+    byteCount = (byteCount + 7u) & ~7u;
+
+    // PORT: lazy palette byte-order fixup.  CI texture palettes are 16-bit
+    // RGBA5551 entries that pass1 BSWAP32 has corrupted (each 4-byte word
+    // has its bytes reversed, swapping the two pixels in the word AND each
+    // pixel's byte order).  Apply BSWAP32 to restore N64 BE order before
+    // copying into palette_staging.  Idempotent.
+    portRelocFixupTextureAtRuntime(src, byteCount);
 
     if (tmem >= 256) {
         // N64 TMEM palette area starts at tmem word 256. Each CI4 palette = 16 entries = 16 tmem words.
         uint32_t paletteByteOffset = (tmem - 256) * 2;
 
         if (high_index == 255 && paletteByteOffset == 0) {
-            // CI8: full 256-entry palette spanning both halves
+            // CI8: full 256-entry palette spanning both halves (fast path).
             memcpy(mRdp->palette_staging[0], src, 256);
             memcpy(mRdp->palette_staging[1], src + 256, 256);
             mRdp->palettes[0] = mRdp->palette_staging[0];
@@ -2315,13 +3623,32 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
             mRdp->palette_dram_addr[0] = src;
             mRdp->palette_dram_addr[1] = src + 256;
         } else if (paletteByteOffset < 256) {
-            // Palettes 0-7 range
-            uint32_t copyLen = (paletteByteOffset + byteCount <= 256) ? byteCount : (256 - paletteByteOffset);
-            memcpy(mRdp->palette_staging[0] + paletteByteOffset, src, copyLen);
+            // Load starts in the first palette half (palettes 0-7).
+            // Fill staging[0] up to the half boundary.
+            uint32_t firstLen = (paletteByteOffset + byteCount <= 256) ? byteCount : (256 - paletteByteOffset);
+            memcpy(mRdp->palette_staging[0] + paletteByteOffset, src, firstLen);
             mRdp->palettes[0] = mRdp->palette_staging[0];
             mRdp->palette_dram_addr[0] = src;
+
+            // PORT: if the load crosses the half boundary, spill the remaining
+            // bytes into staging[1].  On real N64 hardware a single LOADTLUT
+            // copies (high_index + 1) entries starting at the tile's tmem
+            // offset, and a load that begins in the lower half but extends
+            // past it naturally continues into the upper half.  SSB64 uses
+            // this pattern for several CI8 materials whose authors chose a
+            // non-standard high_index (e.g. textbooks at hi=254, wall posters
+            // at hi=212/226) — without this spill the upper half of the
+            // palette is left holding stale data and roughly half of each
+            // affected texture samples garbage colors.
+            if (paletteByteOffset + byteCount > 256) {
+                uint32_t spilloverLen = (paletteByteOffset + byteCount) - 256;
+                if (spilloverLen > 256) spilloverLen = 256;
+                memcpy(mRdp->palette_staging[1], src + firstLen, spilloverLen);
+                mRdp->palettes[1] = mRdp->palette_staging[1];
+                mRdp->palette_dram_addr[1] = src + firstLen;
+            }
         } else {
-            // Palettes 8-15 range
+            // Load starts in the second palette half (palettes 8-15).
             uint32_t offset = paletteByteOffset - 256;
             uint32_t copyLen = (offset + byteCount <= 256) ? byteCount : (256 - offset);
             memcpy(mRdp->palette_staging[1] + offset, src, copyLen);
@@ -2333,11 +3660,21 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
         mRdp->palettes[1] = src;
         mRdp->palette_dram_addr[1] = src;
     }
+
+    // CI textures bake palette data into the decoded GPU texture, so a TLUT
+    // load must invalidate any previously imported texture using that palette.
+    mRdp->textures_changed[0] = true;
+    mRdp->textures_changed[1] = true;
 }
 
 void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt) {
     SUPPORT_CHECK(uls == 0);
     SUPPORT_CHECK(ult == 0);
+
+    if (mRdp->texture_to_load.addr == nullptr) {
+        SPDLOG_ERROR("GfxDpLoadBlock: missing texture image for tile {}", tile);
+        return;
+    }
 
     // The lrs field rather seems to be number of pixels to load
     uint32_t word_size_shift = 0;
@@ -2363,6 +3700,14 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
         size_bytes *= mRdp->texture_to_load.raw_tex_metadata.h_byte_scale;
         size_bytes *= mRdp->texture_to_load.raw_tex_metadata.v_pixel_scale;
     }
+
+    // PORT: lazy texture byte-order fixup.  For data that lives inside a
+    // reloc file, the on-disk texture is in N64 BE byte order; pass1 BSWAP32
+    // reversed each u32 word.  This call applies BSWAP32 again idempotently
+    // the first time a texture is loaded.  Catches runtime-built fighter
+    // material loadblocks that pass2 and the chain walk both miss.
+    portRelocFixupTextureAtRuntime(mRdp->texture_to_load.addr, orig_size_bytes);
+
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes = orig_size_bytes;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes = size_bytes;
     // Compute actual per-line DRAM stride from SetTextureImage width when available.
@@ -2422,6 +3767,11 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
 void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t lrt) {
     SUPPORT_CHECK(tile == G_TX_LOADTILE);
 
+    if (mRdp->texture_to_load.addr == nullptr) {
+        SPDLOG_ERROR("GfxDpLoadTile: missing texture image for tile {}", tile);
+        return;
+    }
+
     uint32_t word_size_shift = 0;
     switch (mRdp->texture_to_load.siz) {
         case G_IM_SIZ_4b:
@@ -2461,6 +3811,22 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
         full_image_line_size_bytes *= h_byte_scale;
         tile_line_size_bytes *= h_byte_scale;
     }
+
+    // PORT: lazy texture byte-order fixup for the LoadTile path.  The decode
+    // loop in ImportTexture* reads pixels at (y * full_image_line_size_bytes
+    // + x * pixel_size) for y in [0, tile_height), x in [0, tile_width), so
+    // we must fix up bytes all the way to
+    //   start_offset_bytes + (tile_height - 1) * full_image_line_size_bytes
+    //                      + tile_line_size_bytes.
+    // An earlier version used `start_offset_bytes + orig_size_bytes`, which
+    // equals `start_offset_bytes + tile_line_size_bytes * tile_height` and
+    // falls short whenever tile_width < full_image_width: the last row's
+    // rightmost (full_image_line_size_bytes - tile_line_size_bytes) bytes
+    // would stay in pass1-swapped (LE) state, rendering a byte-reversed
+    // opaque strip at the bottom of the tile (Yoster "thin line" bug).
+    // Fixup is idempotent so over-covering by one stride row is harmless.
+    portRelocFixupTextureAtRuntime(mRdp->texture_to_load.addr,
+                                   start_offset_bytes + tile_height * full_image_line_size_bytes);
 
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes = orig_size_bytes;
     mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes = size_bytes;
@@ -2605,8 +3971,22 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
     lrxf = lrxf / (4.0f * HALF_SCREEN_WIDTH(mActiveFrameBuffer)) - 1.0f;
     lryf = -(lryf / (4.0f * HALF_SCREEN_HEIGHT(mActiveFrameBuffer))) + 1.0f;
 
-    ulxf = AdjXForAspectRatio(ulxf);
-    lrxf = AdjXForAspectRatio(lrxf);
+    // SSB64 port widescreen: do NOT apply the clip-x compression to
+    // TextureRectangle ops. The 3D world (Interpreter::GfxSpVertex) widens
+    // via AdjXForAspectRatio so the camera shows more world horizontally,
+    // but stage backgrounds and HUD elements are authored as full-screen
+    // 2D rects whose UV mapping is fixed to a 4:3 layout — compressing
+    // their X bounds shrinks them inward and leaves black side strips. We
+    // keep them at their authored 4:3 NDC range; the FB clear (black) fills
+    // the side strips. Bringing those into widescreen needs per-game rect
+    // anchoring (cf. SoH's GFX_DIMENSIONS_FROM_LEFT_EDGE), which is Phase 2
+    // scope.
+    if (mWidescreenActive) {
+        // Phase 1: leave rect coords at their 4:3-authored NDC values.
+    } else {
+        ulxf = AdjXForAspectRatio(ulxf);
+        lrxf = AdjXForAspectRatio(lrxf);
+    }
 
     struct LoadedVertex* ul = &mRsp->loaded_vertices[MAX_VERTICES + 0];
     struct LoadedVertex* ll = &mRsp->loaded_vertices[MAX_VERTICES + 1];
@@ -2665,6 +4045,21 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
 
 void Interpreter::GfxDpTextureRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, uint8_t tile, int16_t uls,
                                         int16_t ult, int16_t dsdx, int16_t dtdy, bool flip) {
+    // Skip draws targeting the Z buffer.  N64 game code sometimes flips the
+    // color image to the Z buffer address, draws a texture or fill to it to
+    // manipulate depth values (e.g. for an alpha-based stencil that a
+    // following XLU draw AA-samples), then flips back to the primary FB.
+    // Fast3D doesn't emulate that address redirection — all draws go to the
+    // primary FB regardless of `color_image_address` — so the "mask" draw
+    // otherwise appears as a solid opaque rectangle behind the visible
+    // result. SSB64's off-screen fighter magnifier bubble in
+    // ifCommonPlayerMagnifyUpdateRender is the canonical case (rendered as
+    // a black square with the circle inside). Matches the same skip in
+    // GfxDpFillRectangle ("Don't clear Z buffer here since we already did
+    // it with glClear").
+    if (mRdp->color_image_address == mRdp->z_buf_address) {
+        return;
+    }
     // printf("render %d at %d\n", tile, lrx);
     uint64_t saved_combine_mode = mRdp->combine_mode;
     if ((mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_COPY) {
@@ -2779,7 +4174,21 @@ void Interpreter::GfxDpImageRectangle(int32_t tile, int32_t w, int32_t h, int32_
 
 void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
     if (mRdp->color_image_address == mRdp->z_buf_address) {
-        // Don't clear Z buffer here since we already did it with glClear
+        // PORT: SSB64's mvOpeningRoom transition Outline issues a full-screen
+        // FillRectangle to ZB right before drawing the visible silhouette tris
+        // with G_RM_AA_OPA_SURF (Z_CMP enabled). On real hardware that fill
+        // rewrites Z to a uniform value so the subsequent tris always pass
+        // depth comparison. Previously we just skipped this entirely under
+        // the assumption that the framebuffer's depth attachment had already
+        // been cleared by a glClear at start-of-frame, but that assumption
+        // doesn't hold mid-frame: the wallpaper drew with G_RM_AA_ZB_OPA_SURF
+        // (Z_UPD set) and filled the depth buffer with its own values, so
+        // Outline tris Z-fail and the transition silhouette never appears.
+        // Treat the redirect-fill as an actual depth clear so the Outline's
+        // subsequent OPA tris have a clean Z buffer to draw against.
+        Flush();
+        mRapi->ClearFramebuffer(false, true);
+        mRenderingState.depth_test_and_mask = 0xff; /* invalidate cached state */
         return;
     }
     uint32_t mode = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE));
@@ -2954,20 +4363,28 @@ void Interpreter::Gfxs2dexRecyCopy(F3DuObjSprite* spr) {
 }
 
 void* Interpreter::SegAddr(uintptr_t w1) {
-    // Segmented?
-    if (w1 & 1) {
-        uint32_t segNum = (uint32_t)(w1 >> 24);
+    if (w1 <= UINT32_MAX) {
+        void* relocPtr = portRelocTryResolvePointer((uint32_t)w1);
 
-        uint32_t offset = w1 & 0x00FFFFFE;
-
-        if (mSegmentPointers[segNum] != 0) {
-            return (void*)(mSegmentPointers[segNum] + offset);
-        } else {
-            return (void*)w1;
+        if (relocPtr != nullptr) {
+            return relocPtr;
         }
-    } else {
-        return (void*)w1;
     }
+
+    // Raw reloc-file display lists still use classic N64 segmented addresses,
+    // while some libultraship-generated commands tag the low bit. Support both.
+    uint32_t segNum = (uint32_t)(w1 >> 24);
+
+    if ((segNum < MAX_SEGMENT_POINTERS) && (mSegmentPointers[segNum] != 0)) {
+        uint32_t offset = (uint32_t)(w1 & 0x00FFFFFF);
+
+        if ((w1 & 1) != 0) {
+            offset &= ~1u;
+        }
+        return (void*)(mSegmentPointers[segNum] + offset);
+    }
+
+    return (void*)w1;
 }
 
 #define C0(pos, width) ((cmd->words.w0 >> (pos)) & ((1U << width) - 1))
@@ -2977,7 +4394,11 @@ void GfxExecStack::start(F3DGfx* dlist) {
     while (!cmd_stack.empty())
         cmd_stack.pop();
     gfx_path.clear();
-    cmd_stack.push(dlist);
+    F3DGfx* normalized = portNormalizeDisplayListPointer(dlist);
+#ifdef PORT_DIAG_HAVE_ASAN
+    diagRecordDLPush(nullptr, dlist, normalized, "ExecStack::start");
+#endif
+    cmd_stack.push(normalized);
     disp_stack.clear();
 }
 
@@ -3005,13 +4426,21 @@ void GfxExecStack::branch(F3DGfx* caller) {
     F3DGfx* old = cmd_stack.top();
     cmd_stack.pop();
     cmd_stack.push(nullptr);
-    cmd_stack.push(old);
+    F3DGfx* normalized = portNormalizeDisplayListPointer(old);
+#ifdef PORT_DIAG_HAVE_ASAN
+    diagRecordDLPush(caller, old, normalized, "ExecStack::branch");
+#endif
+    cmd_stack.push(normalized);
 
     gfx_path.push_back(caller);
 }
 
 void GfxExecStack::call(F3DGfx* caller, F3DGfx* callee) {
-    cmd_stack.push(callee);
+    F3DGfx* normalized = portNormalizeDisplayListPointer(callee);
+#ifdef PORT_DIAG_HAVE_ASAN
+    diagRecordDLPush(caller, callee, normalized, "ExecStack::call");
+#endif
+    cmd_stack.push(normalized);
     gfx_path.push_back(caller);
 }
 
@@ -3111,7 +4540,7 @@ bool gfx_mtx_handler_f3d(F3DGfx** cmd0) {
 bool gfx_mtx_otr_filepath_handler_custom_f3dex2(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    const char* fileName = (const char*)cmd->words.w1;
+    const char* fileName = (const char*)gfx->SegAddr(cmd->words.w1);
     const int32_t* mtx = (const int32_t*)Ship::Context::GetInstance()->GetResourceManager()->GetResourceRawPointer(
         (const char*)fileName);
 
@@ -3125,7 +4554,7 @@ bool gfx_mtx_otr_filepath_handler_custom_f3dex2(F3DGfx** cmd0) {
 bool gfx_mtx_otr_filepath_handler_custom_f3d(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    const char* fileName = (const char*)cmd->words.w1;
+    const char* fileName = (const char*)gfx->SegAddr(cmd->words.w1);
     const int32_t* mtx = (const int32_t*)Ship::Context::GetInstance()->GetResourceManager()->GetResourceRawPointer(
         (const char*)fileName);
 
@@ -3248,7 +4677,7 @@ bool gfx_movemem_handler_otr(F3DGfx** cmd0) {
 bool gfx_push_shader(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    const char* shader = (char*)cmd->words.w1;
+    const char* shader = (const char*)gfx->SegAddr(cmd->words.w1);
 
     gfx->mShaders[gfx->mShadersIndex] = shader;
     gfx->mShaderStack.push(gfx->mShadersIndex);
@@ -3315,12 +4744,36 @@ bool gfx_texture_handler_f3d(F3DGfx** cmd0) {
     return false;
 }
 
+// If SegAddr fell through every resolution path, w1 came back unchanged as a
+// raw value. Sub-segment-range values (<= 0x0FFFFFFF) cannot be valid host
+// pointers; dereferencing them in GfxSpVertex SIGSEGVs at fault_addr =
+// resolved_w1. Skip the load and log so the upstream state corruption that
+// seeded the bad pointer remains traceable. Mirrors the SETTIMG guard added
+// in upstream LUS PR #1042.
+static inline bool gfx_vtx_addr_is_unresolved(const void* addr) {
+    return (uintptr_t)addr <= 0x0FFFFFFFu;
+}
+
 // Almost all versions of the microcode have their own version of this opcode
 bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
-    gfx->GfxSpVertex(C0(12, 8), C0(1, 7) - C0(12, 8), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+    uint32_t n_vertices = C0(12, 8);
+    uint32_t v_dest_end = C0(1, 7);
+    const F3DVtx* vertices = (const F3DVtx*)gfx->SegAddr(cmd->words.w1);
+
+    if (gfx_vtx_addr_is_unresolved(vertices)) {
+        SPDLOG_ERROR("G_VTX(f3dex2) skipped: unresolved addr=0x{:x} n={} dest_end={} (raw w1=0x{:x})",
+                     (uintptr_t)vertices, n_vertices, v_dest_end, (uintptr_t)cmd->words.w1);
+        return false;
+    }
+
+    // Lazy vertex byte-order fixup (port-side, Option A).
+    // Per-vertex idempotency handles overlapping sub-region reloads.
+    portRelocFixupVertexAtRuntime((const void*)vertices, n_vertices);
+
+    gfx->GfxSpVertex(n_vertices, v_dest_end - n_vertices, vertices);
 
     return false;
 }
@@ -3328,7 +4781,14 @@ bool gfx_vtx_handler_f3dex2(F3DGfx** cmd0) {
 bool gfx_vtx_handler_f3dex(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    gfx->GfxSpVertex(C0(10, 6), C0(17, 7), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+
+    const F3DVtx* vertices = (const F3DVtx*)gfx->SegAddr(cmd->words.w1);
+    if (gfx_vtx_addr_is_unresolved(vertices)) {
+        SPDLOG_ERROR("G_VTX(f3dex) skipped: unresolved addr=0x{:x} n={} dest={} (raw w1=0x{:x})",
+                     (uintptr_t)vertices, C0(10, 6), C0(17, 7), (uintptr_t)cmd->words.w1);
+        return false;
+    }
+    gfx->GfxSpVertex(C0(10, 6), C0(17, 7), vertices);
 
     return false;
 }
@@ -3337,7 +4797,14 @@ bool gfx_vtx_handler_f3d(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
-    gfx->GfxSpVertex((C0(0, 16)) / sizeof(F3DVtx), C0(16, 4), (const F3DVtx*)gfx->SegAddr(cmd->words.w1));
+    const F3DVtx* vertices = (const F3DVtx*)gfx->SegAddr(cmd->words.w1);
+    if (gfx_vtx_addr_is_unresolved(vertices)) {
+        SPDLOG_ERROR("G_VTX(f3d) skipped: unresolved addr=0x{:x} n={} dest={} (raw w1=0x{:x})",
+                     (uintptr_t)vertices, (C0(0, 16)) / sizeof(F3DVtx), C0(16, 4),
+                     (uintptr_t)cmd->words.w1);
+        return false;
+    }
+    gfx->GfxSpVertex((C0(0, 16)) / sizeof(F3DVtx), C0(16, 4), vertices);
 
     return false;
 }
@@ -3380,7 +4847,7 @@ bool gfx_vtx_hash_handler_custom(F3DGfx** cmd0) {
 bool gfx_vtx_otr_filepath_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    char* fileName = (char*)cmd->words.w1;
+    char* fileName = (char*)gfx->SegAddr(cmd->words.w1);
     (*cmd0)++;
     cmd = *cmd0;
     size_t vtxCnt = cmd->words.w0;
@@ -3395,8 +4862,9 @@ bool gfx_vtx_otr_filepath_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_dl_otr_filepath_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    char* fileName = (char*)cmd->words.w1;
+    char* fileName = (char*)gfx->SegAddr(cmd->words.w1);
     F3DGfx* nDL =
         (F3DGfx*)Ship::Context::GetInstance()->GetResourceManager()->GetResourceRawPointer((const char*)fileName);
 
@@ -3430,6 +4898,68 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
+
+    // PORT FIX: stride correction for runtime segment 0x0E DLs.
+    //
+    // SSB64 builds per-MObj material setup sub-DLs in the graphics heap and
+    // points segment 0x0E at them via gsSPSegment(0xE, runtime_buf).  The
+    // stored model DL then calls into them with `gsSPDisplayList(0x0E000000 + N)`
+    // where N is the BYTE offset within the runtime buffer.
+    //
+    // On N64, each Gfx is 8 bytes, so N=8 means "second cmd".  On the port,
+    // game-built runtime DLs use the libultraship native 16-byte Gfx layout
+    // (uintptr_t w0; uintptr_t w1;), so "second cmd" is at byte offset 16.
+    //
+    // SegAddr returns mSegmentPointers[0x0E] + N (raw byte offset).  When the
+    // segment base is heap-allocated (game-built widened DL), we need to
+    // convert: cmd_index = N / 8; widened_offset = cmd_index * sizeof(F3DGfx).
+    //
+    // Without this, the interpreter lands halfway through a 16-byte widened
+    // cmd and reads w1-of-cmdN, w0-of-cmdN+1 as if they were one cmd —
+    // producing a pointer-shaped "opcode" and a cmd-word-shaped "pointer",
+    // which then dispatches as garbage G_VTX with bogus vertex addresses.
+    {
+        uint8_t segByte = (uint8_t)((cmd->words.w1 >> 24) & 0xFF);
+        if (segByte == 0x0E) {
+            uint32_t segNum = 0x0E;
+            uintptr_t segBase = (segNum < MAX_SEGMENT_POINTERS) ? gfx->mSegmentPointers[segNum] : 0;
+            if (segBase != 0) {
+                uintptr_t segFileBase = 0;
+                size_t segFileSize = 0;
+                bool baseInFile = portRelocFindContainingFile(reinterpret_cast<const void*>(segBase),
+                                                              &segFileBase, &segFileSize);
+                if (!baseInFile) {
+                    /* Heap-built widened DL: convert N64 byte offset → widened. */
+                    uint32_t n64_offset = (uint32_t)(cmd->words.w1 & 0x00FFFFFF);
+                    if ((n64_offset & 7u) == 0u) {
+                        uint32_t cmd_index = n64_offset / PORT_PACKED_GFX_SIZE;
+                        subGFX = (F3DGfx*)(segBase + cmd_index * sizeof(F3DGfx));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback for packed seg=0x0E G_DL commands left unresolved by
+    // portNormalizeDisplayListPointer.  SegAddr returns the runtime segment
+    // 0x0E base + offset when the game has set it via gsSPSegment(0xE, ...).
+    // If no runtime segment is set, SegAddr returns the raw w1 (a garbage
+    // pointer like 0x0E000000+offset); in that case fall back to the calling
+    // DL's containing reloc file (intra-file sub-DL branch).
+    {
+        uint8_t segByte = (uint8_t)((cmd->words.w1 >> 24) & 0xFF);
+        if (segByte == 0x0E && (uintptr_t)subGFX == cmd->words.w1) {
+            uintptr_t fileBase = 0;
+            size_t fileSize = 0;
+            if (portRelocFindContainingFile(cmd, &fileBase, &fileSize)) {
+                uint32_t offset = (uint32_t)(cmd->words.w1 & 0x00FFFFFF);
+                if (offset < fileSize) {
+                    subGFX = (F3DGfx*)(fileBase + offset);
+                }
+            }
+        }
+    }
+
     if (C0(16, 1) == 0) {
         // Push return address
         if (subGFX != nullptr) {
@@ -3472,7 +5002,8 @@ bool gfx_dl_index_handler(F3DGfx** cmd0) {
     F3DGfx* cmd = (*cmd0);
     uint8_t segNum = (uint8_t)(cmd->words.w1 >> 24);
     uint32_t index = (uint32_t)(cmd->words.w1 & 0x00FFFFFF);
-    uintptr_t segAddr = (segNum << 24) | (index * sizeof(F3DGfx)) + 1;
+    uintptr_t segmentBase = (segNum < MAX_SEGMENT_POINTERS) ? gfx->mSegmentPointers[segNum] : 0;
+    uintptr_t segAddr = (segNum << 24) | (index * portGetDisplayListStride(segmentBase)) + 1;
 
     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(segAddr);
     if (C0(16, 1) == 0) {
@@ -3490,7 +5021,8 @@ bool gfx_dl_index_handler(F3DGfx** cmd0) {
 
 // TODO handle special OTR opcodes later...
 bool gfx_pushcd_handler_custom(F3DGfx** cmd0) {
-    gfx_push_current_dir((char*)(*cmd0)->words.w1);
+    Interpreter* gfx = mInstance.lock().get();
+    gfx_push_current_dir((char*)gfx->SegAddr((*cmd0)->words.w1));
     return false;
 }
 
@@ -3524,12 +5056,19 @@ bool gfx_branch_z_otr_handler_f3dex2(F3DGfx** cmd0) {
 bool gfx_end_dl_handler_common(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     gfx->mMarkerOn = false;
+
     g_exec_stack.ret();
     return true;
 }
 
-bool gfx_set_prim_depth_handler_rdp(F3DGfx** cmd) {
-    // TODO Implement this command...
+bool gfx_set_prim_depth_handler_rdp(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    // gDPSetPrimDepth packs `(z, dz)` as `_SHIFTL(z,16,16) | _SHIFTL(dz,0,16)`
+    // into words.w1; both are u16 N64 Z-buffer values. Stored here for later
+    // consumption when a draw uses other_mode_l & G_ZS_PRIM.
+    gfx->mRdp->prim_depth_z = (uint16_t)((cmd->words.w1 >> 16) & 0xFFFF);
+    gfx->mRdp->prim_depth_dz = (uint16_t)(cmd->words.w1 & 0xFFFF);
     return false;
 }
 
@@ -3685,7 +5224,6 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
     uintptr_t i = (uintptr_t)gfx->SegAddr(cmd->words.w1);
-
     char* imgData = (char*)i;
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetdata = {};
@@ -3713,7 +5251,9 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
 
     // If the resolved address is still in the N64 segmented range, SegAddr
     // failed to resolve it (segment not set up). Skip to avoid dereferencing
-    // invalid memory.
+    // invalid memory. Don't widen the cap to 4 GB on 64-bit hosts — non-PIE
+    // Linux binaries hand out valid brk-arena pointers below 4 GB, and a
+    // wider guard drops legitimate texture-set commands.
     if (i <= 0x0FFFFFFF) {
         return false;
     }
@@ -3787,8 +5327,9 @@ bool gfx_set_timg_otr_hash_handler_custom(F3DGfx** cmd0) {
 }
 
 bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    const char* fileName = (char*)cmd->words.w1;
+    const char* fileName = (const char*)gfx->SegAddr(cmd->words.w1);
 
     uint32_t texFlags = 0;
     RawTexMetadata rawTexMetadata = {};
@@ -3796,7 +5337,6 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
     std::shared_ptr<Fast::Texture> texture = std::static_pointer_cast<Fast::Texture>(
         Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess(fileName));
     if (texture != nullptr) {
-        Interpreter* gfx = mInstance.lock().get();
         texFlags = texture->Flags;
         rawTexMetadata.width = texture->Width;
         rawTexMetadata.height = texture->Height;
@@ -3852,7 +5392,7 @@ bool gfx_reset_fb_handler_custom(F3DGfx** cmd0) {
 bool gfx_copy_fb_handler_custom(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
-    bool* hasCopiedPtr = (bool*)cmd->words.w1;
+    bool* hasCopiedPtr = (bool*)gfx->SegAddr(cmd->words.w1);
 
     gfx->Flush();
     gfx->CopyFrameBuffer(C0(11, 11), C0(0, 11), (bool)C0(22, 1), hasCopiedPtr);
@@ -3865,7 +5405,7 @@ bool gfx_read_fb_handler_custom(F3DGfx** cmd0) {
 
     int32_t width, height;
     [[maybe_unused]] int32_t ulx, uly;
-    uint16_t* rgba16Buffer = (uint16_t*)cmd->words.w1;
+    uint16_t* rgba16Buffer = (uint16_t*)gfx->SegAddr(cmd->words.w1);
     int fbId = C0(0, 8);
     bool bswap = C0(8, 1);
     ++(*cmd0);
@@ -3898,17 +5438,17 @@ bool gfx_register_blended_texture_handler_custom(F3DGfx** cmd0) {
     // Flush incase we are replacing a previous blended texture that hasn't been finialized to the GPU
     gfx->Flush();
 
-    char* timg = (char*)cmd->words.w1;
+    char* timg = (char*)gfx->SegAddr(cmd->words.w1);
 
     ++(*cmd0);
     cmd = *cmd0;
 
-    uint8_t* mask = (uint8_t*)cmd->words.w0;
-    uint8_t* replacementTex = (uint8_t*)cmd->words.w1;
+    uint8_t* mask = (uint8_t*)gfx->SegAddr(cmd->words.w0);
+    uint8_t* replacementTex = (uint8_t*)gfx->SegAddr(cmd->words.w1);
 
     if (!gfx_check_image_signature(timg)) {
-        SPDLOG_ERROR(
-            "OTR_G_REGBLENDEDTEX: Texture is not a valid OTR resource name, unable to register blended texture");
+        SPDLOG_ERROR("OTR_G_REGBLENDEDTEX: invalid texture resource pointer cmd={} timg={} mask={} replacement={}",
+                     fmt::ptr(cmd), fmt::ptr(timg), fmt::ptr(mask), fmt::ptr(replacementTex));
         return false;
     }
 
@@ -4279,6 +5819,7 @@ static constexpr UcodeHandler rdpHandlers = {
     { RDP_G_RDPFULLSYNC, { "mRdpFULLSYNC", gfx_stubbed_command_handler } },          // mRdpFULLSYNC (-23)
     { RDP_G_SETSCISSOR, { "G_SETSCISSOR", gfx_SetScissor_handler_rdp } },            // G_SETSCISSOR (-19)
     { RDP_G_SETPRIMDEPTH, { "G_SETPRIMDEPTH", gfx_set_prim_depth_handler_rdp } },    // G_SETPRIMDEPTH (-18)
+    { RDP_G_SETCONVERT, { "G_SETCONVERT", gfx_stubbed_command_handler } },            // G_SETCONVERT (-20)
     { RDP_G_RDPSETOTHERMODE, { "mRdpSETOTHERMODE", gfx_rdp_set_other_mode_rdp } },   // mRdpSETOTHERMODE (-17)
     { RDP_G_LOADTLUT, { "G_LOADTLUT", gfx_load_tlut_handler_rdp } },                 // G_LOADTLUT (-16)
     { RDP_G_SETTILESIZE, { "G_SETTILESIZE", gfx_set_tile_size_handler_rdp } },       // G_SETTILESIZE (-14)
@@ -4338,6 +5879,15 @@ static constexpr UcodeHandler otrHandlers = {
 static constexpr UcodeHandler f3dex2Handlers = {
     { F3DEX2_G_NOOP, { "G_NOOP", gfx_noop_handler_f3dex2 } },
     { F3DEX2_G_SPNOOP, { "G_SPNOOP", gfx_noop_handler_f3dex2 } },
+    // gSPMvpRecalc — SSB64 emits this before patching the MVP via G_MW_MATRIX
+    // moveword writes (see src/sys/objdisplay.c draw types 41-46).  On N64 the
+    // microcode marks the MVP cache dirty so the next vertex transform recomputes
+    // it from M*P; the patches that follow then overwrite individual MVP slots.
+    // Fast3D recomputes MP_matrix eagerly inside GfxSpMatrix, so this command is
+    // a no-op for us — the G_MW_MATRIX case in GfxSpMovewordF3dex2 does the
+    // actual work.  Without this entry the interpreter spammed [critical]
+    // "Unhandled OP code: 0xD5" once per emission.
+    { F3DEX2_G_SPECIAL_1, { "G_SPECIAL_1", gfx_noop_handler_f3dex2 } },
     { F3DEX2_G_CULLDL, { "G_CULLDL", gfx_cull_dl_handler_f3dex2 } },
     { F3DEX2_G_MTX, { "G_MTX", gfx_mtx_handler_f3dex2 } },
     { F3DEX2_G_POPMTX, { "G_POPMTX", gfx_pop_mtx_handler_f3dex2 } },
@@ -4354,6 +5904,10 @@ static constexpr UcodeHandler f3dex2Handlers = {
     { F3DEX2_G_QUAD, { "G_QUAD", gfx_quad_handler_f3dex2 } },
     { F3DEX2_G_SETOTHERMODE_L, { "G_SETOTHERMODE_L", gfx_othermode_l_handler_f3dex2 } },
     { F3DEX2_G_SETOTHERMODE_H, { "G_SETOTHERMODE_H", gfx_othermode_h_handler_f3dex2 } },
+    // SSB64 mixes S2DEX BG commands into F3DEX2 display lists without a G_LOAD_UCODE switch.
+    // The RSP was already running the right ucode from task setup; on PC we handle them here.
+    { F3DEX2_G_BG_1CYC, { "G_BG_1CYC", gfx_bg_1cyc_handler_s2dex } },
+    { F3DEX2_G_BG_COPY, { "G_BG_COPY", gfx_bg_copy_handler_s2dex } },
 };
 
 static constexpr UcodeHandler f3dexHandlers = {
@@ -4471,7 +6025,23 @@ static void gfx_set_ucode_handler(UcodeHandlers ucode) {
 static void gfx_step() {
     auto& cmd = g_exec_stack.currCmd();
     auto cmd0 = cmd;
+#ifdef PORT_DIAG_HAVE_ASAN
+    /* DIAG: PR #133 lead-gap. If the cmd we're about to deref is in poisoned
+       memory (typically: stale segment binding to a freed/past-end heap
+       address), dump the segment table + recent segment writes + DL pushes
+       so we can identify which lead's coverage has the hole. Then let the
+       deref proceed — ASan will halt with its own report and the diag dump
+       will be in the log just above. */
+    if (cmd != nullptr && __asan_region_is_poisoned((void*)cmd, sizeof(*cmd)) != nullptr) {
+        diagDumpAll(cmd, "gfx_step: about to deref poisoned cmd");
+    }
+#endif
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
+
+    if (sGbiTraceCallback) {
+        sGbiTraceCallback((uintptr_t)cmd->words.w0, (uintptr_t)cmd->words.w1,
+                          (int)g_exec_stack.cmd_stack.size() - 1);
+    }
 
 #ifdef USE_GBI_TRACE
     if (cmd->words.trace.valid &&
@@ -4499,13 +6069,15 @@ static void gfx_step() {
         // Guard against null or N64-segment addresses that would crash in strlen/strncmp.
         if (opcode == OTR_G_VTX_OTR_FILEPATH || opcode == OTR_G_SETTIMG_OTR_FILEPATH ||
             opcode == OTR_G_DL_OTR_FILEPATH || opcode == OTR_G_PUSHCD || opcode == OTR_G_MTX_OTR_FILEPATH ||
-            opcode == OTR_G_PUSH_SHADER) {
-            uintptr_t w1 = (uintptr_t)cmd->words.w1;
-            if (w1 < 0x10000
+            opcode == OTR_G_PUSH_SHADER || opcode == OTR_G_REGBLENDEDTEX) {
+            Interpreter* gfx = mInstance.lock().get();
+            uintptr_t resolvedW1 = (uintptr_t)gfx->SegAddr((uintptr_t)cmd->words.w1);
+            if (resolvedW1 < 0x10000
 #if UINTPTR_MAX > 0xFFFFFFFFu
                 // On 64-bit: filter kernel/sentinel addresses.
-                || w1 > 0x0000FFFFFFFFFFFFull
+                || resolvedW1 > 0x0000FFFFFFFFFFFFull
 #endif
+                || !gfxPointerHasReadableBytes(reinterpret_cast<const void*>(resolvedW1), 8)
             ) {
                 ++g_exec_stack.currCmd();
                 return;
@@ -4524,11 +6096,34 @@ static void gfx_step() {
                 return;
             }
         } else {
-            SPDLOG_CRITICAL("Unhandled OP code: 0x{:X}, for loaded ucode: {}", (uint8_t)opcode,
-                            (uint32_t)ucode_handler_index);
+            const PortPackedDisplayListInfo* packedInfo = nullptr;
+            size_t packedIndex = 0;
+
+            if (portFindNormalizedDisplayListCommand(cmd, &packedInfo, &packedIndex)) {
+                const uintptr_t rawCmd = reinterpret_cast<uintptr_t>(packedInfo->source) + (packedIndex * PORT_PACKED_GFX_SIZE);
+                const uintptr_t fileOffset = rawCmd - packedInfo->fileBase;
+                uintptr_t describedBase = 0;
+                size_t describedSize = 0;
+                uint32_t fileId = UINT32_MAX;
+                const char* filePath = nullptr;
+
+                portRelocDescribePointer(packedInfo->source, &describedBase, &describedSize, &fileId, &filePath);
+
+                SPDLOG_CRITICAL(
+                    "Unhandled OP code: 0x{:X}, for loaded ucode: {} cmd={} w0=0x{:08X} w1=0x{:016X} raw_source={} raw_cmd=0x{:X} file_offset=0x{:X} cmd_index={} file_id={} file_path={} file_base=0x{:X} file_size=0x{:X}",
+                    (uint8_t)opcode, (uint32_t)ucode_handler_index, fmt::ptr(cmd), (uint32_t)cmd->words.w0,
+                    (uint64_t)cmd->words.w1, fmt::ptr(packedInfo->source), rawCmd, fileOffset, packedIndex, fileId,
+                    (filePath != nullptr) ? filePath : "(unknown)", describedBase, describedSize);
+            } else {
+                SPDLOG_CRITICAL("Unhandled OP code: 0x{:X}, for loaded ucode: {} cmd={} w0=0x{:08X} w1=0x{:016X}",
+                                (uint8_t)opcode, (uint32_t)ucode_handler_index, fmt::ptr(cmd),
+                                (uint32_t)cmd->words.w0, (uint64_t)cmd->words.w1);
+            }
         }
     } else {
-        SPDLOG_CRITICAL("Unhandled OP code: 0x{:X}, invalid ucode: {}", (uint8_t)opcode, (uint32_t)ucode_handler_index);
+        SPDLOG_CRITICAL("Unhandled OP code: 0x{:X}, invalid ucode: {} cmd={} w0=0x{:08X} w1=0x{:016X}",
+                        (uint8_t)opcode, (uint32_t)ucode_handler_index, fmt::ptr(cmd), (uint32_t)cmd->words.w0,
+                        (uint64_t)cmd->words.w1);
     }
 
     ++cmd;
@@ -4549,6 +6144,32 @@ void Interpreter::SpReset() {
     mRsp->lookat[1].dir[2] = 0;
     CalculateNormalDir(&mRsp->lookat[0], mRsp->current_lookat_coeffs[0]);
     CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
+    // Clear the SP segment table at the start of each frame.  On real N64,
+    // each RSP task loads fresh ucode and starts with no segments mapped;
+    // games re-bind segments via gSPSegment within the frame's display list.
+    // Without this clear, a segment written in frame N (e.g. lbtransition's
+    // gSPSegment(0x1, ...) for VS-results photocopy) survives into frame N+1
+    // pointing at heap memory the game has already freed.  Subsequent G_VTX
+    // commands that resolve through that stale segment then either deref
+    // freed memory (SIGSEGV) or fall through SegAddr unresolved and produce
+    // the addr=0x01... fingerprint of issue #103 / #128.
+    for (int i = 0; i < MAX_SEGMENT_POINTERS; i++) {
+#ifdef PORT_DIAG_HAVE_ASAN
+        uintptr_t _old = mSegmentPointers[i];
+#endif
+        mSegmentPointers[i] = 0;
+#ifdef PORT_DIAG_HAVE_ASAN
+        if (_old != 0) {
+            diagRecordSegWrite(i, _old, 0, "SpReset", 0);
+        }
+#endif
+    }
+#ifdef PORT_DIAG_HAVE_ASAN
+    /* DIAG: bump frame counter so log entries line up with frames. SpReset is
+       called at the start of every Run/RunGuiOnly invocation. */
+    portDiagBumpFrame();
+#endif
+    ResetRdpTextureState();
 }
 
 void Interpreter::GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
@@ -4621,11 +6242,23 @@ bool Interpreter::ViewportMatchesRendererResolution() {
     // to avoid issues with retina scaling.
     return false;
 #else
+    // Port-driven override: pinning this to false keeps mRendersToFb=true so
+    // mGameFb is populated every frame, which the GPU-readback bridge depends
+    // on. Without it, Windows D3D11 in the default 1x / no-MSAA config would
+    // draw straight to the swap-chain back buffer (FB 0) and the prior
+    // gameplay frame would be unrecoverable post-Present.
+    if (mForceRenderToFb) {
+        return false;
+    }
     if (mCurDimensions.width == mGameWindowViewport.width && mCurDimensions.height == mGameWindowViewport.height) {
         return true;
     }
     return false;
 #endif
+}
+
+void Interpreter::SetForceRenderToFb(bool force) {
+    mForceRenderToFb = force;
 }
 
 void Interpreter::StartFrame() {
@@ -4681,6 +6314,10 @@ void Interpreter::StartFrame() {
 
 GfxExecStack g_exec_stack = {};
 
+extern "C" void gfx_set_trace_callback(GbiTraceCallbackFn callback) {
+    sGbiTraceCallback = callback;
+}
+
 void Interpreter::RunGuiOnly() {
     SpReset();
 
@@ -4690,8 +6327,20 @@ void Interpreter::RunGuiOnly() {
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
+    // Always clear the swap-chain back buffer (fb 0) to a known color before
+    // anything else.  With DXGI FLIP_DISCARD swap effect the back buffer
+    // contents are undefined after Present(), and the dockspace gap around
+    // the "Main Game" ImGui window otherwise shows stale content from two
+    // frames ago — visible as a flickering two-tone gray border.
+    mRapi->StartDrawToFramebuffer(0, 1);
+    mRapi->ClearFramebuffer(true, false);
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
-    mRapi->ClearFramebuffer(false, true);
+    // SSB64 port widescreen: when active, the game's 4:3-authored scissor
+    // covers only ~93% of the FB width, leaving uncleared side strips that
+    // show prior-frame garbage. Force a color clear in that mode. Outside
+    // widescreen we keep the depth-only clear so the GPU-readback bridge
+    // (port_capture_*) still has prior color contents available.
+    mRapi->ClearFramebuffer(mWidescreenActive, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
@@ -4732,8 +6381,16 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
+    // See RunGuiOnly() for why we clear fb 0 unconditionally.
+    mRapi->StartDrawToFramebuffer(0, 1);
+    mRapi->ClearFramebuffer(true, false);
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
-    mRapi->ClearFramebuffer(false, true);
+    // SSB64 port widescreen: when active, the game's 4:3-authored scissor
+    // covers only ~93% of the FB width, leaving uncleared side strips that
+    // show prior-frame garbage. Force a color clear in that mode. Outside
+    // widescreen we keep the depth-only clear so the GPU-readback bridge
+    // (port_capture_*) still has prior color contents available.
+    mRapi->ClearFramebuffer(mWidescreenActive, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
@@ -4746,8 +6403,6 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
         if (dbg->IsDebugging()) {
             g_exec_stack.gfx_path.push_back(cmd);
             if (dbg->HasBreakPoint(g_exec_stack.gfx_path)) {
-                // On a breakpoint with the active framebuffer still set, we need to reset back to prevent
-                // soft locking the renderer
                 if (mFbActive) {
                     mFbActive = 0;
                     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, 1);
@@ -4784,6 +6439,14 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
 
         assert(0 && "active framebuffer was never reset back to original");
     }
+}
+
+void Interpreter::PresentCurrentFramebuffer() {
+    mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
+                                       false, true, true, !mRendersToFb);
+    mRapi->StartFrame();
+    mRapi->StartDrawToFramebuffer(0, 1);
+    mRapi->ClearFramebuffer(true, false);
 }
 
 void Interpreter::EndFrame() {
@@ -4935,6 +6598,9 @@ int32_t gfx_check_image_signature(const char* imgData) {
         return 0;
     }
 #endif
+    if (!gfxPointerHasReadableBytes(imgData, 8)) {
+        return 0;
+    }
 
     return Ship::Context::GetInstance()->GetResourceManager()->OtrSignatureCheck(imgData);
 }
@@ -4962,6 +6628,23 @@ void Interpreter::UnregisterBlendedTexture(const char* name) {
     }
 
     mMaskedTextures.erase(name);
+}
+
+void Interpreter::RegisterFbTexture(const void* base, size_t sizeBytes, int fbId,
+                                    float u0, float v0, float u1, float v1) {
+    if (base == nullptr || sizeBytes == 0) {
+        return;
+    }
+    uintptr_t b = reinterpret_cast<uintptr_t>(base);
+    mFbTextures[b] = FbTextureRange{ b + sizeBytes, fbId, u0, v0, u1, v1 };
+}
+
+void Interpreter::UnregisterFbTexture(const void* base) {
+    mFbTextures.erase(reinterpret_cast<uintptr_t>(base));
+}
+
+void Interpreter::ClearFbTextures() {
+    mFbTextures.clear();
 }
 
 // New getters and setters
