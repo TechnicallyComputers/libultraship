@@ -6,7 +6,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#include <DbgHelp.h>
+#include <dbghelp.h> /* lowercase: MinGW cross-compile from Linux (see gfx_sdl2.cpp) */
 #include <errhandlingapi.h>
 #include <inttypes.h>
 #include <excpt.h>

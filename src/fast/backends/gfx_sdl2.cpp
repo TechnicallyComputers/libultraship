@@ -37,8 +37,9 @@
 #include "ship/window/gui/Gui.h"
 
 #ifdef _WIN32
-#include <WTypesbase.h>
-#include <Windows.h>
+/* Lowercase headers: Linux-hosted MinGW sysroots are case-sensitive (WTypesbase.h fails). */
+#include <wtypesbase.h>
+#include <windows.h>
 #include <SDL_syswm.h>
 #endif
 
