@@ -5506,6 +5506,15 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     // Linux binaries hand out valid brk-arena pointers below 4 GB, and a
     // wider guard drops legitimate texture-set commands.
     if (i <= 0x0FFFFFFF) {
+        const char* render_diag = std::getenv("SSB64_RENDER_DIAG");
+        if (render_diag != nullptr && render_diag[0] != '\0' && render_diag[0] != '0') {
+            static uintptr_t sLastRejectedTimg = 0;
+            if (sLastRejectedTimg != i) {
+                sLastRejectedTimg = i;
+                SPDLOG_WARN("SSB64_RENDER_DIAG: G_SETTIMG rejected addr=0x{:x} (unresolved segment or below 256MB cap)",
+                            static_cast<uint32_t>(i));
+            }
+        }
         return false;
     }
 
