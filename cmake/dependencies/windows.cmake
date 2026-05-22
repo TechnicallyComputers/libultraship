@@ -24,4 +24,11 @@ target_link_libraries(ImGui PUBLIC opengl32 GLEW::GLEW)
 # ImGui DX11 / Win32 backends and LUS WASAPI / Raphnet HID helpers (not transitive from SDL2).
 # Required for MinGW cross packages that only bundle runtime DLLs via objdump (see BattleShip
 # scripts/package-mingw-windows.sh bundle_mingw_dlls).
-target_link_libraries(ImGui PUBLIC d3dcompiler dwmapi hid setupapi ksguid)
+if(MSVC)
+	# Resolve ksguid.lib at configure time (BattleShip cmake/WindowsSdkUmLib.cmake on MODULE_PATH).
+	include(WindowsSdkUmLib)
+	windows_sdk_um_link_lib(ImGui PUBLIC ksguid)
+	target_link_libraries(ImGui PUBLIC d3dcompiler dwmapi hid setupapi)
+else()
+	target_link_libraries(ImGui PUBLIC d3dcompiler dwmapi hid setupapi ksguid)
+endif()
