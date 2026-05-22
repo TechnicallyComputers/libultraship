@@ -21,11 +21,5 @@ endif()
 find_package(GLEW REQUIRED)
 target_link_libraries(ImGui PUBLIC opengl32 GLEW::GLEW)
 
-# ImGui DX11 / Win32 backends and LUS WASAPI / Raphnet HID helpers (not transitive from SDL2).
-# Required for MinGW cross packages that only bundle runtime DLLs via objdump (see BattleShip
-# scripts/package-mingw-windows.sh bundle_mingw_dlls).
-# Always use WindowsSdkUmLib on WIN32 — do not gate on MSVC; GHA can miss MSVC during
-# libultraship's early project() and would fall back to bare ksguid → LNK1181.
-include(${CMAKE_CURRENT_LIST_DIR}/../WindowsSdkUmLib.cmake)
-windows_sdk_um_link_lib(ImGui PUBLIC ksguid)
+# ImGui DX11 / Win32 backends (WASAPI ksguid is on libultraship — see src/CMakeLists.txt).
 target_link_libraries(ImGui PUBLIC d3dcompiler dwmapi hid setupapi)
