@@ -25,8 +25,8 @@ target_link_libraries(ImGui PUBLIC opengl32 GLEW::GLEW)
 # Required for MinGW cross packages that only bundle runtime DLLs via objdump (see BattleShip
 # scripts/package-mingw-windows.sh bundle_mingw_dlls).
 if(MSVC)
-	# Resolve ksguid.lib at configure time (BattleShip cmake/WindowsSdkUmLib.cmake on MODULE_PATH).
-	include(WindowsSdkUmLib)
+	# Full path at configure time — Ninja link does not inherit LIB from pwsh on GHA.
+	include(${CMAKE_CURRENT_LIST_DIR}/../WindowsSdkUmLib.cmake)
 	windows_sdk_um_link_lib(ImGui PUBLIC ksguid)
 	target_link_libraries(ImGui PUBLIC d3dcompiler dwmapi hid setupapi)
 else()
