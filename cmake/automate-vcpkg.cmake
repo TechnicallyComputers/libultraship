@@ -116,9 +116,25 @@ macro(vcpkg_bootstrap)
 endmacro()
 
 macro(_install_or_update_vcpkg)
+    # A prior failed configure can leave an empty/partial tree; git pull then
+    # fails with "fatal: not a git repository" and README.md never appears.
+    if(EXISTS ${VCPKG_ROOT})
+        if(NOT EXISTS "${VCPKG_ROOT}/.git" OR NOT EXISTS "${VCPKG_ROOT}/README.md")
+            message(STATUS "Removing invalid vcpkg directory at ${VCPKG_ROOT}")
+            file(REMOVE_RECURSE ${VCPKG_ROOT})
+        endif()
+    endif()
+
     if(NOT EXISTS ${VCPKG_ROOT})
         message(STATUS "Cloning vcpkg in ${VCPKG_ROOT}")
-        execute_process(COMMAND git clone https://github.com/Microsoft/vcpkg.git ${VCPKG_ROOT} --depth 1)
+        execute_process(
+            COMMAND git clone https://github.com/Microsoft/vcpkg.git ${VCPKG_ROOT} --depth 1
+            RESULT_VARIABLE _vcpkg_clone_result
+            ERROR_VARIABLE _vcpkg_clone_stderr
+        )
+        if(_vcpkg_clone_result)
+            message(FATAL_ERROR "vcpkg git clone failed (${_vcpkg_clone_result}): ${_vcpkg_clone_stderr}")
+        endif()
 
         # If a reproducible build is desired (and potentially old libraries are # ok), uncomment the
         # following line and pin the vcpkg repository to a specific githash.
@@ -126,7 +142,15 @@ macro(_install_or_update_vcpkg)
     else()
         # The following command has no effect if the vcpkg repository is in a detached head state.
         message(STATUS "Auto-updating vcpkg in ${VCPKG_ROOT}")
-        execute_process(COMMAND git pull WORKING_DIRECTORY ${VCPKG_ROOT})
+        execute_process(
+            COMMAND git pull
+            WORKING_DIRECTORY ${VCPKG_ROOT}
+            RESULT_VARIABLE _vcpkg_pull_result
+            ERROR_VARIABLE _vcpkg_pull_stderr
+        )
+        if(_vcpkg_pull_result)
+            message(WARNING "vcpkg git pull failed (${_vcpkg_pull_result}): ${_vcpkg_pull_stderr}")
+        endif()
     endif()
 
     if(NOT EXISTS ${VCPKG_ROOT}/README.md)
