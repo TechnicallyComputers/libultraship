@@ -76,9 +76,8 @@ if (WIN32)
     enable_language(C)
     check_type_size("void*" SIZEOF_VOID_P BUILTIN_TYPES_ONLY)
     
-    if (SIZEOF_VOID_P EQUAL 8 AND NOT DEFINED ${CMAKE_VS_PLATFORM_NAME})
+    if(SIZEOF_VOID_P EQUAL 8 AND NOT CMAKE_VS_PLATFORM_NAME)
         message(STATUS "Using Vcpkg triplet 'x64-windows'")
-        
         set(VCPKG_TRIPLET x64-windows)
     endif()
 endif()
@@ -166,8 +165,16 @@ macro(_install_or_update_vcpkg)
     endif()
 
     if(NOT EXISTS ${VCPKG_EXEC})
-        message("Bootstrapping vcpkg in ${VCPKG_ROOT}")
-        execute_process(COMMAND ${VCPKG_BOOTSTRAP} WORKING_DIRECTORY ${VCPKG_ROOT})
+        message(STATUS "Bootstrapping vcpkg in ${VCPKG_ROOT}")
+        execute_process(
+            COMMAND ${VCPKG_BOOTSTRAP}
+            WORKING_DIRECTORY ${VCPKG_ROOT}
+            RESULT_VARIABLE _vcpkg_bootstrap_result
+            ERROR_VARIABLE _vcpkg_bootstrap_stderr
+        )
+        if(_vcpkg_bootstrap_result)
+            message(FATAL_ERROR "vcpkg bootstrap failed (${_vcpkg_bootstrap_result}): ${_vcpkg_bootstrap_stderr}")
+        endif()
     endif()
 
     if(NOT EXISTS ${VCPKG_EXEC})
@@ -178,20 +185,29 @@ endmacro()
 
 # Installs the list of packages given as parameters using Vcpkg
 macro(vcpkg_install_packages)
-    
-    # Need the given list to be space-separated
-    #string (REPLACE ";" " " PACKAGES_LIST_STR "${ARGN}")
+    message(STATUS "Installing/Updating vcpkg packages: ${ARGN}")
 
-    message(STATUS "Installing/Updating the following vcpkg-packages: ${PACKAGES_LIST_STR}")
-
-    if (VCPKG_TRIPLET)
+    if(VCPKG_TRIPLET)
         set(ENV{VCPKG_DEFAULT_TRIPLET} "${VCPKG_TRIPLET}")
     endif()
 
+    set(_vcpkg_install_cmd ${VCPKG_EXEC} install ${ARGN})
+    if(VCPKG_TARGET_TRIPLET)
+        list(APPEND _vcpkg_install_cmd --triplet ${VCPKG_TARGET_TRIPLET})
+    elseif(VCPKG_TRIPLET)
+        list(APPEND _vcpkg_install_cmd --triplet ${VCPKG_TRIPLET})
+    endif()
+
     execute_process(
-        COMMAND ${VCPKG_EXEC} install ${ARGN}
+        COMMAND ${_vcpkg_install_cmd}
         WORKING_DIRECTORY ${VCPKG_ROOT}
-        )
+        RESULT_VARIABLE _vcpkg_install_result
+        OUTPUT_VARIABLE _vcpkg_install_stdout
+        ERROR_VARIABLE _vcpkg_install_stderr
+    )
+    if(_vcpkg_install_result)
+        message(FATAL_ERROR "vcpkg install failed (${_vcpkg_install_result}):\n${_vcpkg_install_stdout}\n${_vcpkg_install_stderr}")
+    endif()
 endmacro()
     
 # MIT License
