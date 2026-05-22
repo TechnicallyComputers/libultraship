@@ -15,6 +15,11 @@ const IID IID_IMMDeviceEnumerator = __uuidof(IMMDeviceEnumerator);
 const IID IID_IAudioClient = __uuidof(IAudioClient);
 const IID IID_IAudioRenderClient = __uuidof(IAudioRenderClient);
 
+// KSDATAFORMAT_SUBTYPE_PCM is normally provided by ksguid.lib, which is absent from
+// many Windows 10 SDK um/x64 drops (e.g. 10.0.26100.0 on GitHub runners).
+static const GUID SSB64_KSDATAFORMAT_SUBTYPE_PCM = {
+    0x00000001, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+
 namespace Ship {
 
 void WasapiAudioPlayer::ThrowIfFailed(HRESULT res) {
@@ -56,7 +61,7 @@ bool WasapiAudioPlayer::SetupStream() {
             desired.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
             desired.dwChannelMask = KSAUDIO_SPEAKER_5POINT1;
             desired.Samples.wValidBitsPerSample = 16;
-            desired.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+            desired.SubFormat = SSB64_KSDATAFORMAT_SUBTYPE_PCM;
 
             ThrowIfFailed(mClient->Initialize(
                 AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,

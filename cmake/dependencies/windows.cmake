@@ -21,5 +21,5 @@ endif()
 find_package(GLEW REQUIRED)
 target_link_libraries(ImGui PUBLIC opengl32 GLEW::GLEW)
 
-# ImGui DX11 / Win32 backends (WASAPI ksguid is on libultraship — see src/CMakeLists.txt).
+# ImGui DX11 / Win32 backends.
 target_link_libraries(ImGui PUBLIC d3dcompiler dwmapi hid setupapi)

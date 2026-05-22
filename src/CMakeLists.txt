@@ -58,13 +58,6 @@ target_link_libraries(libultraship
     PUBLIC ImGui
 )
 
-# WASAPI 5.1 (WasapiAudioPlayer.cpp). PRIVATE + full path avoids PUBLIC ImGui propagation
-# writing bare ksguid.lib into the port exe's Ninja link line on MSVC CI.
-if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    include(${CMAKE_CURRENT_LIST_DIR}/../cmake/WindowsSdkUmLib.cmake)
-    windows_sdk_um_link_lib(libultraship PRIVATE ksguid)
-endif()
-
 target_link_libraries(libultraship PUBLIC stb)
 
 if (GFX_DEBUG_DISASSEMBLER)
