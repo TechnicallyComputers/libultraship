@@ -225,6 +225,8 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
   private:
     void CreateDepthStencilObjects(uint32_t width, uint32_t height, uint32_t msaa_count, ID3D11DepthStencilView** view,
                                    ID3D11ShaderResourceView** srv);
+    // 1x1 RGBA placeholder for draws that bind a tile before UploadTexture (avoids null SRV → D3DKMTOpenResource AV).
+    void EnsurePlaceholderTexture();
 
     HMODULE mDX11Module;
 
@@ -322,6 +324,9 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     // Run.
     std::vector<PostProcessSlangProgramD3D11> mPostProcessSlangPrograms;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPostProcessSlangVbo;
+
+    bool mPlaceholderTextureReady = false;
+    uint32_t mPlaceholderTextureId = 0;
 };
 
 std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures& cc_features,

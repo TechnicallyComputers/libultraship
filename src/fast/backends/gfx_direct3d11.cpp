@@ -666,6 +666,30 @@ void GfxRenderingAPIDX11::SetUseAlpha(bool use_alpha) {
     // Already part of the pipeline state from shader info
 }
 
+void GfxRenderingAPIDX11::EnsurePlaceholderTexture() {
+    if (mPlaceholderTextureReady && mPlaceholderTextureId < mTextures.size() &&
+        mTextures[mPlaceholderTextureId].resource_view.Get() != nullptr) {
+        return;
+    }
+
+    const uint32_t placeholderId = NewTexture();
+    const int savedTile = mCurrentTile;
+    const uint32_t savedTextureId = mCurrentTextureIds[savedTile];
+    static const uint8_t whitePx[4] = { 255, 255, 255, 255 };
+
+    mPlaceholderTextureId = placeholderId;
+    mCurrentTile = 0;
+    mCurrentTextureIds[0] = placeholderId;
+    UploadTexture(whitePx, 1, 1);
+    SetSamplerParameters(0, false, G_TX_WRAP, G_TX_WRAP);
+    mCurrentTile = savedTile;
+    mCurrentTextureIds[savedTile] = savedTextureId;
+    mPlaceholderTextureReady =
+        (mPlaceholderTextureId < mTextures.size() &&
+         mTextures[mPlaceholderTextureId].resource_view.Get() != nullptr &&
+         mTextures[mPlaceholderTextureId].sampler_state.Get() != nullptr);
+}
+
 void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
 
     if (mLastDepthTest != mCurrentDepthTest || mLastDepthMask != mCurrentDepthMask) {
@@ -730,26 +754,62 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
     }
 
     bool textures_changed = false;
+    EnsurePlaceholderTexture();
+    ID3D11ShaderResourceView* placeholderSrv =
+        (mPlaceholderTextureReady && mPlaceholderTextureId < mTextures.size())
+            ? mTextures[mPlaceholderTextureId].resource_view.Get()
+            : nullptr;
+    ID3D11SamplerState* placeholderSampler =
+        (mPlaceholderTextureReady && mPlaceholderTextureId < mTextures.size())
+            ? mTextures[mPlaceholderTextureId].sampler_state.Get()
+            : nullptr;
 
     for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
-        if (mShaderProgram->usedTextures[i]) {
-            if (mLastResourceViews[i].Get() != mTextures[mCurrentTextureIds[i]].resource_view.Get()) {
-                mLastResourceViews[i] = mTextures[mCurrentTextureIds[i]].resource_view.Get();
-                mContext->PSSetShaderResources(i, 1, mTextures[mCurrentTextureIds[i]].resource_view.GetAddressOf());
+        ID3D11ShaderResourceView* srv = nullptr;
+        ID3D11SamplerState* sampler = nullptr;
 
-                if (mCurrentFilterMode == FILTER_THREE_POINT) {
-                    mPerDrawCbData.mTextures[i].width = mTextures[mCurrentTextureIds[i]].width;
-                    mPerDrawCbData.mTextures[i].height = mTextures[mCurrentTextureIds[i]].height;
-                    mPerDrawCbData.mTextures[i].linear_filtering = mTextures[mCurrentTextureIds[i]].linear_filtering;
+        if (mShaderProgram->usedTextures[i]) {
+            const uint32_t texId = mCurrentTextureIds[i];
+            if (texId < mTextures.size()) {
+                TextureData& tex = mTextures[texId];
+                srv = tex.resource_view.Get();
+                sampler = tex.sampler_state.Get();
+                if (mCurrentFilterMode == FILTER_THREE_POINT && srv != nullptr) {
+                    mPerDrawCbData.mTextures[i].width = tex.width;
+                    mPerDrawCbData.mTextures[i].height = tex.height;
+                    mPerDrawCbData.mTextures[i].linear_filtering = tex.linear_filtering;
                     textures_changed = true;
                 }
-
-                if (mLastSamplerStates[i].Get() != mTextures[mCurrentTextureIds[i]].sampler_state.Get()) {
-                    mLastSamplerStates[i] = mTextures[mCurrentTextureIds[i]].sampler_state.Get();
-                }
+            }
+            if (srv == nullptr) {
+                srv = placeholderSrv;
+            }
+            if (sampler == nullptr) {
+                sampler = placeholderSampler;
+            }
+            if (srv == nullptr) {
+                // Cannot satisfy the shader's texture() fetch — skip this draw.
+                return;
+            }
+            if (mLastResourceViews[i].Get() != srv) {
+                mLastResourceViews[i] = srv;
+                mContext->PSSetShaderResources(i, 1, &srv);
+            }
+            if (sampler != nullptr && mLastSamplerStates[i].Get() != sampler) {
+                mLastSamplerStates[i] = sampler;
+                mContext->PSSetSamplers(i, 1, &sampler);
+            }
+        } else {
+            if (mLastResourceViews[i].Get() != nullptr) {
+                mLastResourceViews[i].Reset();
+                mContext->PSSetShaderResources(i, 1, &srv);
+            }
+            if (mLastSamplerStates[i].Get() != nullptr) {
+                mLastSamplerStates[i].Reset();
+                ID3D11SamplerState* nullSampler = nullptr;
+                mContext->PSSetSamplers(i, 1, &nullSampler);
             }
         }
-        mContext->PSSetSamplers(i, 1, mTextures[mCurrentTextureIds[i]].sampler_state.GetAddressOf());
     }
 
     // Set per-draw constant buffer
