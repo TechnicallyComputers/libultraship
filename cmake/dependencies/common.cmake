@@ -189,27 +189,39 @@ FetchContent_MakeAvailable(prism)
 #=========== hidapi (native Raphnet N64 USB adapter support) ===========
 # Static-only, hidraw backend on Linux (no libusb dep). 0.14.0 fixes a
 # macOS hid_close deadlock present in 0.13.x.
-set(HIDAPI_BUILD_HIDTEST OFF CACHE BOOL "" FORCE)
-set(HIDAPI_WITH_TESTS OFF CACHE BOOL "" FORCE)
-set(HIDAPI_INSTALL_TARGETS OFF CACHE BOOL "" FORCE)
-if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
-    set(HIDAPI_WITH_HIDRAW ON CACHE BOOL "" FORCE)
-    set(HIDAPI_WITH_LIBUSB OFF CACHE BOOL "" FORCE)
+# Android: NDK has no libusb/pkg-config; use a no-op stub (Raphnet is desktop USB).
+if(CMAKE_SYSTEM_NAME STREQUAL "Android")
+    set(_LUS_HIDAPI_ANDROID_DIR "${CMAKE_CURRENT_LIST_DIR}/hidapi_android")
+    add_library(hidapi_android_stub STATIC "${_LUS_HIDAPI_ANDROID_DIR}/hidapi_android_stub.c")
+    target_include_directories(hidapi_android_stub PUBLIC "${_LUS_HIDAPI_ANDROID_DIR}")
+    add_library(hidapi_include INTERFACE)
+    target_include_directories(hidapi_include INTERFACE "${_LUS_HIDAPI_ANDROID_DIR}")
+    add_library(hidapi::include ALIAS hidapi_include)
+    add_library(hidapi::hidapi ALIAS hidapi_android_stub)
+    message(STATUS "libultraship: hidapi Android stub (no libusb; Raphnet disabled)")
+else()
+    set(HIDAPI_BUILD_HIDTEST OFF CACHE BOOL "" FORCE)
+    set(HIDAPI_WITH_TESTS OFF CACHE BOOL "" FORCE)
+    set(HIDAPI_INSTALL_TARGETS OFF CACHE BOOL "" FORCE)
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
+        set(HIDAPI_WITH_HIDRAW ON CACHE BOOL "" FORCE)
+        set(HIDAPI_WITH_LIBUSB OFF CACHE BOOL "" FORCE)
+    endif()
+    # Force static while pulling hidapi in, then restore caller's preference.
+    set(_LUS_BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
+    set(BUILD_SHARED_LIBS OFF)
+    # hidapi-0.14.0 declares cmake_minimum_required(3.4.3); CMake 4.x removed
+    # < 3.5 compatibility, so allow it via policy minimum.
+    set(_LUS_CMP_MIN_SAVED ${CMAKE_POLICY_VERSION_MINIMUM})
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    FetchContent_Declare(
+        hidapi
+        GIT_REPOSITORY https://github.com/libusb/hidapi.git
+        GIT_TAG hidapi-0.14.0
+    )
+    FetchContent_MakeAvailable(hidapi)
+    set(CMAKE_POLICY_VERSION_MINIMUM ${_LUS_CMP_MIN_SAVED})
+    unset(_LUS_CMP_MIN_SAVED)
+    set(BUILD_SHARED_LIBS ${_LUS_BUILD_SHARED_LIBS_SAVED})
+    unset(_LUS_BUILD_SHARED_LIBS_SAVED)
 endif()
-# Force static while pulling hidapi in, then restore caller's preference.
-set(_LUS_BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
-set(BUILD_SHARED_LIBS OFF)
-# hidapi-0.14.0 declares cmake_minimum_required(3.4.3); CMake 4.x removed
-# < 3.5 compatibility, so allow it via policy minimum.
-set(_LUS_CMP_MIN_SAVED ${CMAKE_POLICY_VERSION_MINIMUM})
-set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-FetchContent_Declare(
-    hidapi
-    GIT_REPOSITORY https://github.com/libusb/hidapi.git
-    GIT_TAG hidapi-0.14.0
-)
-FetchContent_MakeAvailable(hidapi)
-set(CMAKE_POLICY_VERSION_MINIMUM ${_LUS_CMP_MIN_SAVED})
-unset(_LUS_CMP_MIN_SAVED)
-set(BUILD_SHARED_LIBS ${_LUS_BUILD_SHARED_LIBS_SAVED})
-unset(_LUS_BUILD_SHARED_LIBS_SAVED)
