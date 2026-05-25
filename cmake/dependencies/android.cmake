@@ -1,6 +1,9 @@
 include(FetchContent)
 
 #=================== SDL2 ===================
+# SDLActivity loads libSDL2.so before libmain.so — must not be folded into libmain.
+set(SDL_SHARED ON CACHE BOOL "Build SDL2 as a shared library for Android APK" FORCE)
+set(SDL_STATIC OFF CACHE BOOL "" FORCE)
 find_package(SDL2 QUIET)
 if (NOT ${SDL2_FOUND})
     FetchContent_Declare(
