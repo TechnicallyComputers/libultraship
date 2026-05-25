@@ -1289,7 +1289,7 @@ void GfxRenderingAPIOGL::RunPostProcessSlang(int progId, int dstFb,
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-#ifndef USE_OPENGLES // GL_FRAMEBUFFER_SRGB is desktop GL only; GLES uses sRGB formats without this enable
+#if !defined(USE_OPENGLES) && !defined(__ANDROID__)
     if (dstFbInfo.postProcessFormat == PostProcessFboFormat::Srgb) {
         glEnable(GL_FRAMEBUFFER_SRGB);
     }
@@ -1501,7 +1501,7 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int or
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-#ifndef USE_OPENGLES // GL_FRAMEBUFFER_SRGB is desktop GL only; GLES uses sRGB formats without this enable
+#if !defined(USE_OPENGLES) && !defined(__ANDROID__)
     // sRGB intermediate FBOs need GL_FRAMEBUFFER_SRGB enabled so the
     // hardware encodes the fragment's linear output back to sRGB on
     // write. For non-sRGB destinations the state is ignored by spec
