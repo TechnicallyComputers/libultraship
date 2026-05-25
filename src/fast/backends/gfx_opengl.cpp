@@ -1289,9 +1289,11 @@ void GfxRenderingAPIOGL::RunPostProcessSlang(int progId, int dstFb,
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
+#ifndef USE_OPENGLES // GL_FRAMEBUFFER_SRGB is desktop GL only; GLES uses sRGB formats without this enable
     if (dstFbInfo.postProcessFormat == PostProcessFboFormat::Srgb) {
         glEnable(GL_FRAMEBUFFER_SRGB);
     }
+#endif
 
     // Upload the chain-built UBO blob. The buffer was allocated at
     // CreatePostProcessSlangProgram time so we just refill.
@@ -1499,6 +1501,7 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int or
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
+#ifndef USE_OPENGLES // GL_FRAMEBUFFER_SRGB is desktop GL only; GLES uses sRGB formats without this enable
     // sRGB intermediate FBOs need GL_FRAMEBUFFER_SRGB enabled so the
     // hardware encodes the fragment's linear output back to sRGB on
     // write. For non-sRGB destinations the state is ignored by spec
@@ -1507,6 +1510,7 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int or
     if (dstFbInfo.postProcessFormat == PostProcessFboFormat::Srgb) {
         glEnable(GL_FRAMEBUFFER_SRGB);
     }
+#endif
 
     // Sample source FB's color texture on TU0. Filter + wrap mode come
     // from the producer pass's libretro `filter_linearN` / `wrap_modeN`
