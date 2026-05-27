@@ -97,7 +97,7 @@ class Gui {
     std::shared_ptr<GameOverlay> GetGameOverlay();
     void SetMenuBar(std::shared_ptr<GuiMenuBar> menuBar);
     std::shared_ptr<GuiMenuBar> GetMenuBar();
-    void SetMenu(std::shared_ptr<GuiWindow> menu);
+    void SetMenu(std::shared_ptr<GuiWindow> menu, bool initNow = true);
     std::shared_ptr<GuiWindow> GetMenu();
     bool GetMenuOrMenubarVisible();
     bool IsMouseOverAnyGuiItem();

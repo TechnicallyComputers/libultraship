@@ -1029,10 +1029,10 @@ void Gui::SetMenuBar(std::shared_ptr<GuiMenuBar> menuBar) {
     }
 }
 
-void Gui::SetMenu(std::shared_ptr<GuiWindow> menu) {
+void Gui::SetMenu(std::shared_ptr<GuiWindow> menu, bool initNow) {
     mMenu = menu;
 
-    if (GetMenu()) {
+    if (initNow && GetMenu()) {
         GetMenu()->Init();
     }
 }
