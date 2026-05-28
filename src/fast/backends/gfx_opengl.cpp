@@ -1501,15 +1501,7 @@ void GfxRenderingAPIOGL::RunPostProcess(int progId, int srcFb, int dstFb, int or
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-#if !defined(USE_OPENGLES) && !defined(__ANDROID__)
-    // sRGB intermediate FBOs need GL_FRAMEBUFFER_SRGB enabled so the
-    // hardware encodes the fragment's linear output back to sRGB on
-    // write. For non-sRGB destinations the state is ignored by spec
-    // (encoding only happens when the attachment is sRGB-formatted),
-    // so we leave it enabled afterwards rather than thrashing state.
-    // GLES has no equivalent toggle — sRGB encode is implicit when the
-    // attachment is sRGB-formatted, so the call is unneeded there.
-#ifndef USE_OPENGLES
+#ifndef USE_OPENGLES // GLES has no GL_FRAMEBUFFER_SRGB toggle — sRGB encode is implicit when the attachment is sRGB-formatted.
     if (dstFbInfo.postProcessFormat == PostProcessFboFormat::Srgb) {
         glEnable(GL_FRAMEBUFFER_SRGB);
     }
@@ -1891,5 +1883,3 @@ ImTextureID GfxRenderingAPIOGL::GetTextureById(int id) {
 }
 } // namespace Fast
 #endif
-
-#pragma clang diagnostic pop
