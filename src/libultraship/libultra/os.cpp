@@ -24,6 +24,11 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
     // SSB64 controller-init thread, terminate() fires, and spdlog's async
     // pool tears down on the way out, leaving a 0xE06D7363 crash that's
     // hard to diagnose from a user log.
+    //
+    // Android: never load here — SDL_RWFromFile failure paths call JNI
+    // (SDL_getenv → manifest env vars) and CheckJNI aborts off SDLThread.
+    // Mappings are loaded once on the main thread in portAndroidJniWarmupLate().
+#if !defined(__ANDROID__)
     try {
         std::string controllerDb = Ship::Context::LocateFileAcrossAppDirs("gamecontrollerdb.txt");
         int mappingsAdded = SDL_GameControllerAddMappingsFromFile(controllerDb.c_str());
@@ -37,6 +42,7 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
     } catch (...) {
         SPDLOG_ERROR("osContInit: skipping gamecontrollerdb.txt — unknown exception");
     }
+#endif
 
     // Run RaphnetPhysicalDeviceManager init BEFORE SDL_Init(GAMECONTROLLER).
     // The raphnet adapter exposes both a HID joystick interface (which SDL
@@ -46,6 +52,14 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
     // win the race. Internally PreInitRaphnet also globally skip-lists the
     // claimed VIDs so the SDL refresh below ignores them.
     Ship::Context::GetInstance()->GetControlDeck()->PreInitRaphnet();
+
+#if defined(__ANDROID__)
+    // SDL_SetHint and SDL_Init(GAMECONTROLLER) run on SDL_main in
+    // portAndroidJniWarmupLate(). Both call SDL_getenv on Android (manifest
+    // env vars) and CheckJNI aborts when invoked from the controller coroutine.
+    Ship::Context::GetInstance()->GetControlDeck()->Init(controllerBits);
+    return 0;
+#endif
 
     SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
 #if defined(_WIN32)
