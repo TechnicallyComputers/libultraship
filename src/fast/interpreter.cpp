@@ -3820,7 +3820,22 @@ void Interpreter::GfxDpSetTileSize(uint8_t tile, uint16_t uls, uint16_t ult, uin
 }
 
 void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
-    SUPPORT_CHECK(mRdp->texture_to_load.siz == G_IM_SIZ_16b);
+    // PORT: real N64 RDP LOADTLUT always transfers 16-bit TLUT entries
+    // regardless of the SetTextureImage siz, so a non-16b siz is hardware-
+    // tolerated rather than fatal. libultraship's hard SUPPORT_CHECK turned it
+    // into a debug-build abort that the SR synth winner-logo emblem trips on the
+    // VS-results screen. The load below already derives its byte count from
+    // 16-bit entries, so warn (throttled, with context to confirm the source)
+    // and load it as 16b like hardware instead of aborting.
+    if (mRdp->texture_to_load.siz != G_IM_SIZ_16b) {
+        static int sNon16bTlutWarned = 0;
+        if (sNon16bTlutWarned < 16) {
+            sNon16bTlutWarned++;
+            SPDLOG_WARN("GfxDpLoadTlut: non-16b TLUT siz={} tile={} high_index={} addr={} (loading as 16b)",
+                        (int)mRdp->texture_to_load.siz, (int)tile, (unsigned)high_index,
+                        (const void*)mRdp->texture_to_load.addr);
+        }
+    }
 
     uint16_t tmem = mRdp->texture_tile[tile].tmem;
     const uint8_t* src = mRdp->texture_to_load.addr;
@@ -5572,15 +5587,6 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
     // preferred base. Accepting those lets mods use static texture data
     // without a heap-copy workaround.
     if (i <= 0x0FFFFFFF && !gfxPointerInLoadedModule(reinterpret_cast<const void*>(i))) {
-        const char* render_diag = std::getenv("SSB64_RENDER_DIAG");
-        if (render_diag != nullptr && render_diag[0] != '\0' && render_diag[0] != '0') {
-            static uintptr_t sLastRejectedTimg = 0;
-            if (sLastRejectedTimg != i) {
-                sLastRejectedTimg = i;
-                SPDLOG_WARN("SSB64_RENDER_DIAG: G_SETTIMG rejected addr=0x{:x} (unresolved segment or below 256MB cap)",
-                            static_cast<uint32_t>(i));
-            }
-        }
         return false;
     }
 
