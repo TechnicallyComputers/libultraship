@@ -40,8 +40,15 @@ typedef struct EventListener {
  * implicit handling for function imports doesn't extend to data. */
 #if defined(_WIN32) && defined(__DLL__)
 #  define LUS_EVENT_ID_DECL extern __declspec(dllimport)
+/* C++ counterpart: a declaration directly contained in an extern "C"
+ * linkage-specification must not carry a storage-class specifier
+ * ([dcl.link]/7 — GCC rejects `extern "C" extern ...`). The linkage spec
+ * already gives the (non-defining) declaration external C linkage, so the
+ * C++ form drops the redundant `extern` and keeps only dllimport. */
+#  define LUS_EVENT_ID_DECL_CXX __declspec(dllimport)
 #else
 #  define LUS_EVENT_ID_DECL extern
+#  define LUS_EVENT_ID_DECL_CXX
 #endif
 
 #ifndef __cplusplus
@@ -54,7 +61,7 @@ typedef struct EventListener {
 #ifdef INIT_EVENT_IDS
 #define DECLARE_EVENT(eventName) extern "C" uint32_t eventName##ID = -1;
 #else
-#define DECLARE_EVENT(eventName) extern "C" LUS_EVENT_ID_DECL uint32_t eventName##ID;
+#define DECLARE_EVENT(eventName) extern "C" LUS_EVENT_ID_DECL_CXX uint32_t eventName##ID;
 #endif
 #endif
 
