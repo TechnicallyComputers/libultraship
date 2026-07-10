@@ -35,6 +35,8 @@
 #endif
 
 #include "ship/window/gui/Gui.h"
+#include "ship/events/WindowEvents.h"
+#include "libultraship/bridge/eventsbridge.h"
 
 #ifdef _WIN32
 /* Lowercase headers: Linux-hosted MinGW sysroots are case-sensitive (WTypesbase.h fails). */
@@ -662,6 +664,14 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
                         Close();
                     }
                     break;
+                case SDL_WINDOWEVENT_FOCUS_GAINED: {
+                    CALL_EVENT(WindowFocusEvent, true);
+                    break;
+                }
+                case SDL_WINDOWEVENT_FOCUS_LOST: {
+                    CALL_EVENT(WindowFocusEvent, false);
+                    break;
+                }
             }
             break;
         case SDL_DROPFILE:
