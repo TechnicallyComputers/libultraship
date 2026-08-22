@@ -303,10 +303,32 @@ bool gfxPointerInLoadedModule(const void* ptr) {
                            reinterpret_cast<LPCSTR>(ptr), &mod) == 0) {
         return false;
     }
-    return mod != nullptr;
+    // The exception is for mod DLLs only. The main program image must not
+    // count: a non-relocated build occupies low VA, so every N64-segment
+    // leftover (0x01000000, 0x0E000000, ...) would land "inside a module"
+    // and the SETTIMG/G_VTX guards would never fire.
+    return mod != nullptr && mod != GetModuleHandleA(nullptr);
 #else
+    // Same main-image exclusion as Windows. On Linux the port links
+    // non-PIE, so the executable itself owns the sub-256MB VA range that
+    // stale N64-segment addresses decode into; treating "inside the main
+    // binary" as valid mod data structurally disabled these guards
+    // (observed: G_VTX walked vertices=0x1000000 into a SIGSEGV instead
+    // of being skipped). TCC source mods on POSIX are relocated in
+    // memory, not dlopen'd, so they never resolve via dladdr anyway —
+    // only real dlopen'd mod .so's should pass.
+    static void* sMainBase = [] {
+        Dl_info self = {};
+        if (dladdr(reinterpret_cast<void*>(&gfxPointerInLoadedModule), &self) != 0) {
+            return self.dli_fbase;
+        }
+        return static_cast<void*>(nullptr);
+    }();
     Dl_info info = {};
-    return dladdr(const_cast<void*>(ptr), &info) != 0 && info.dli_fbase != nullptr;
+    if (dladdr(const_cast<void*>(ptr), &info) == 0 || info.dli_fbase == nullptr) {
+        return false;
+    }
+    return info.dli_fbase != sMainBase;
 #endif
 }
 
@@ -633,9 +655,14 @@ void RegisterAddressClassifier(AddressClassifierFn fn) {
     sAddressClassifier = fn;
 }
 
+extern "C" void gbi_trace_note_flush(int num_tris);
+
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
+        // Emit a marker into the GBI trace so draw-dump indices can be
+        // correlated with positions in the traced command stream.
+        gbi_trace_note_flush((int)mBufVboNumTris);
         mBufVboLen = 0;
         mBufVboNumTris = 0;
     }
@@ -936,16 +963,75 @@ void Interpreter::TextureCacheClear() {
     std::fill(std::begin(mRenderingState.mTextures), std::end(mRenderingState.mTextures), nullptr);
 }
 
+// FNV-1a over the texture source bytes, 8-byte strides + tail. Reads exactly
+// the range the ImportTexture* miss path would read, so it is precisely as
+// safe as a cache miss.
+static uint64_t PortTextureContentHash(const uint8_t* p, uint32_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h ^= w;
+        h *= 1099511628211ULL;
+    }
+    for (; i < n; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// SSB64_TEXCACHE_VERIFY=0 disables content verification of cache hits.
+// Default is on: the key is raw-pointer identity and SSB64's bump heaps /
+// bridge buffers recycle addresses with identical shapes, so a hit can
+// silently alias a different texture (corrupted particles / backgrounds).
+static bool PortTextureCacheVerifyEnabled() {
+    static int mode = -1;
+    if (mode < 0) {
+        const char* env = std::getenv("SSB64_TEXCACHE_VERIFY");
+        mode = (env != nullptr && env[0] == '0') ? 0 : 1;
+    }
+    return mode != 0;
+}
+
 bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     TextureCacheMap::iterator it = mTextureCache.map.find(key);
     TextureCacheNode** n = &mRenderingState.mTextures[i];
 
+    const bool verify = PortTextureCacheVerifyEnabled() && key.texture_addr != nullptr && key.size_bytes != 0;
+    uint64_t content_hash = 0;
+    if (verify) {
+        content_hash = PortTextureContentHash(key.texture_addr, key.size_bytes);
+    }
+
     if (it != mTextureCache.map.end()) {
-        mRapi->SelectTexture(i, it->second.texture_id);
-        *n = &*it;
-        mTextureCache.lru.splice(mTextureCache.lru.end(), mTextureCache.lru,
-                                 it->second.lru_location); // move to back
-        return true;
+        if (verify && it->second.content_hash != content_hash) {
+            // Stale identity hit: same (addr, shape) key, different bytes.
+            // Evict and fall through to the miss path so the caller
+            // re-imports the current contents.
+            static int sStaleLogCount = 0;
+            if (sStaleLogCount < 64) {
+                SPDLOG_WARN("TextureCache stale-content hit healed: addr={} fmt={} siz={} {}x{} bytes={}",
+                            (const void*)key.texture_addr, key.fmt, key.siz, key.tile_width, key.tile_height,
+                            key.size_bytes);
+                sStaleLogCount++;
+            }
+            mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+            for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
+                if (mRenderingState.mTextures[j] == &*it)
+                    mRenderingState.mTextures[j] = nullptr;
+            }
+            mTextureCache.lru.erase(it->second.lru_location);
+            mTextureCache.map.erase(it);
+            it = mTextureCache.map.end();
+        } else {
+            mRapi->SelectTexture(i, it->second.texture_id);
+            *n = &*it;
+            mTextureCache.lru.splice(mTextureCache.lru.end(), mTextureCache.lru,
+                                     it->second.lru_location); // move to back
+            return true;
+        }
     }
 
     if (mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
@@ -971,6 +1057,7 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     it = mTextureCache.map.insert(std::make_pair(key, TextureCacheValue())).first;
     TextureCacheNode* node = &*it;
     node->second.texture_id = texture_id;
+    node->second.content_hash = content_hash;
     node->second.lru_location = mTextureCache.lru.insert(mTextureCache.lru.end(), { it });
 
     mRapi->SelectTexture(i, texture_id);
@@ -2804,7 +2891,23 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         if (y > w) {
             d->clip_rej |= 8; // CLIP_TOP
         }
-        // if (z < -w) d->clip_rej |= 16; // CLIP_NEAR
+        if (z < -w) {
+            // CLIP_NEAR — outside the near-plane half-space (z + w < 0, a
+            // homogeneous test that is valid for both signs of w). The RSP
+            // trivially rejects triangles whose verts all share this code;
+            // without it, a poly lying entirely outside the near plane
+            // reaches the rasterizer with mixed-sign w and produces a huge
+            // homogeneous wrap-around smear. SSB64 issue #72: the Yoshi
+            // catch flash quad has all four vertices in this half-space and
+            // must never draw (verified against cxd4-LLE RSP). Do NOT
+            // additionally flag all w <= 0 vertices: a partially visible
+            // primitive can legitimately own behind-camera vertices, and
+            // over-flagging them trivially rejects geometry that hardware
+            // clips and draws. Rejection still requires all three verts to share the
+            // flag, so geometry merely crossing the near plane renders
+            // exactly as before.
+            d->clip_rej |= 16;
+        }
         if (z > w) {
             d->clip_rej |= 32; // CLIP_FAR
         }
@@ -2897,29 +3000,49 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         }
     }
 
-    bool depth_test = (mRsp->geometry_mode & G_ZBUFFER) == G_ZBUFFER;
+    // PORT: on the RDP, depth *comparison* is enabled solely by Z_CMP in
+    // other_mode_l; G_ZBUFFER in geometry mode only makes the RSP emit
+    // per-vertex Z (a prerequisite for any Z op, not a request to test).
+    // Deriving depth_test from G_ZBUFFER alone Z-rejects primitives whose
+    // render mode has Z_CMP clear — hardware never compares those. SSB64's
+    // intro explosion draws its red outer ring (Outline mesh) with G_ZBUFFER
+    // set but Z_CMP/Z_UPD clear, immediately after the redirect fill stamps
+    // the whole Z buffer to near: with gm-derived testing every ring pixel
+    // fails and the hardware-visible red starburst border vanishes.
+    bool has_vertex_z = (mRsp->geometry_mode & G_ZBUFFER) == G_ZBUFFER;
+    bool depth_test = has_vertex_z && (mRdp->other_mode_l & Z_CMP) == Z_CMP;
     bool depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
     // PORT: SSB64's mvOpeningRoom transition Overlay/Outline use the N64
     // "redirect color image to Z buffer" idiom: tris are drawn with G_ZBUFFER
     // set in geometry_mode but no Z_CMP/Z_UPD in render mode, so on real
     // hardware they bypass depth comparison and write into the ZB as if it
-    // were a colour buffer. Fast3D ignores the colour-image redirect (so
-    // those tris land on the primary FB instead) and also derives
-    // depth_test from G_ZBUFFER alone — which Z-rejects them against the
-    // stale ZB content from the previous scene draw, making the explosion
-    // sprite invisible. When the redirect is active, gate depth_test on
-    // Z_CMP from other_mode_l (real-hardware semantics) so the Overlay's
-    // white tris reach the framebuffer.
-    bool redirect_active = mRdp->color_image_address == mRdp->z_buf_address && mRdp->color_image_address != nullptr;
+    // were a colour buffer.
+    bool redirect_active = RdpColorImageIsZBuffer();
     if (redirect_active) {
-        depth_test = (mRdp->other_mode_l & Z_CMP) == Z_CMP;
-        depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
+        // On real hardware a redirect-active draw's combiner output is written
+        // to the Z buffer as pixel data — unconditionally, regardless of
+        // Z_UPD (that flag governs the *depth* path, but here the *color*
+        // path is what lands in the Z buffer). Emulate by forcing depth
+        // writes on; the written value is synthesized below (see the
+        // use_prim_depth override) and framebuffer color writes are
+        // suppressed via SetColorWriteMask.
+        depth_mask = true;
     }
     uint8_t depth_test_and_mask = (depth_test ? 1 : 0) | (depth_mask ? 2 : 0);
     if (depth_test_and_mask != mRenderingState.depth_test_and_mask) {
         Flush();
         mRapi->SetDepthTestAndMask(depth_test, depth_mask);
         mRenderingState.depth_test_and_mask = depth_test_and_mask;
+    }
+
+    // Suppress framebuffer color writes while the color image is redirected to
+    // the Z buffer: on hardware such draws have no color side effect. Backends
+    // without an override keep the previous (visible-draw) behavior.
+    bool color_write = !redirect_active;
+    if (color_write != mRenderingState.color_write_enabled) {
+        Flush();
+        mRapi->SetColorWriteMask(color_write);
+        mRenderingState.color_write_enabled = color_write;
     }
 
     bool zmode_decal = (mRdp->other_mode_l & ZMODE_DEC) == ZMODE_DEC;
@@ -3185,6 +3308,21 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // depth-slope is irrelevant once we're producing post-projection Z directly.
     bool use_prim_depth = (mRdp->other_mode_l & G_ZS_PRIM) == G_ZS_PRIM;
     float prim_depth_ndc = (float)mRdp->prim_depth_z / 65535.0f; // 0..1 (Metal-style)
+    if (redirect_active) {
+        // Color-image-redirect-to-Z: the value a redirect-active draw deposits
+        // in the Z buffer is its combiner output packed as RGBA16. SSB64's
+        // uses of the idiom (mvOpeningRoom transition Overlay, magnify mask)
+        // drive the combiner with a constant PRIM color, so synthesize the
+        // 16-bit value from prim_color and write it as constant depth —
+        // exactly the G_ZS_PRIM mechanism. 0xFFFC+ snaps to far (1.0) so a
+        // white fill matches a standard depth clear bit-exactly.
+        uint16_t z16 = (uint16_t)((((uint32_t)mRdp->prim_color.r >> 3) << 11) |
+                                  (((uint32_t)mRdp->prim_color.g >> 3) << 6) |
+                                  (((uint32_t)mRdp->prim_color.b >> 3) << 1) |
+                                  (mRdp->prim_color.a >= 128 ? 1u : 0u));
+        use_prim_depth = true;
+        prim_depth_ndc = (z16 >= 0xFFFC) ? 1.0f : (float)z16 / 65535.0f;
+    }
     if (!clip_parameters.z_is_from_0_to_1) {
         prim_depth_ndc = prim_depth_ndc * 2.0f - 1.0f; // OpenGL [-1,1]
     }
@@ -3267,6 +3405,35 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                                normVMax, v_arr[0]->x, v_arr[0]->y, v_arr[0]->z, v_arr[0]->w, v_arr[1]->x,
                                v_arr[1]->y, v_arr[1]->z, v_arr[1]->w, v_arr[2]->x, v_arr[2]->y, v_arr[2]->z,
                                v_arr[2]->w);
+    }
+
+    // Accumulate this triangle's screen coverage for the port's RCP cost
+    // model (see gfx_get_frame_tri_area_px). The RDP's per-pixel cost is
+    // fillrate-dominated; the DL-word cost model alone cannot see that a
+    // "cheap" 2-triangle quad covers the whole screen — SSB64's opening
+    // authors exploit exactly that (huge climax flash polys) to stall the
+    // RDP for several VIs. Area computed in native-resolution pixels from
+    // the projected NDC positions so it is window-size independent.
+    {
+        float sx[3], sy[3];
+        bool valid = true;
+        for (int i = 0; i < 3; i++) {
+            float w = v_arr[i]->w;
+            if (!(w > 0.0001f || w < -0.0001f)) {
+                valid = false;
+                break;
+            }
+            sx[i] = v_arr[i]->x / w;
+            sy[i] = v_arr[i]->y / w;
+        }
+        if (valid) {
+            float area_ndc = 0.5f * fabsf((sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]));
+            if (area_ndc > 8.0f) {
+                area_ndc = 8.0f; // clamp absurd off-screen tris; scissor bounds real cost
+            }
+            mFrameTriAreaPx +=
+                area_ndc * 0.25f * (float)mNativeDimensions.width * (float)mNativeDimensions.height;
+        }
     }
 
     for (int i = 0; i < 3; i++) {
@@ -3927,6 +4094,16 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
 
     if (mRdp->texture_to_load.addr == nullptr) {
         SPDLOG_ERROR("GfxDpLoadBlock: missing texture image for tile {}", tile);
+        // First occurrences per run: dump the exec-stack so the DL (and thus
+        // the object/file) issuing the NULL SETTIMG is identifiable. The
+        // intro "560 burst" renders an object textureless for a whole clip
+        // with no stale-token log — the pointer field read as zero; this
+        // names the holder.
+        static int sNullTexDiagCount = 0;
+        if (sNullTexDiagCount < 3) {
+            sNullTexDiagCount++;
+            DumpDLDiag(nullptr, "null-settimg-loadblock");
+        }
         return;
     }
 
@@ -4284,6 +4461,17 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
     mRdp->viewport = default_viewport;
     mRdp->viewport_or_scissor_changed = true;
     mRsp->geometry_mode = 0;
+    // RDP semantics: rectangles ARE depth-tested/depth-written when Z_CMP /
+    // Z_UPD are enabled — rects carry no per-pixel Z, so the RDP substitutes
+    // the primitive depth register (gDPSetPrimDepth, G_ZS_PRIM). SSB64's
+    // mvOpeningRoom transition relies on this: the dim-room wallpaper strips
+    // draw at PrimDepth z=0.56 with Z_CMP against the Z mask punched by the
+    // redirect-active Outline/Overlay draws. Route such rects through the
+    // depth-tested tri path; the G_ZS_PRIM handling there supplies the
+    // constant Z. Rects without Z_CMP keep the legacy always-on-top path.
+    if ((mRdp->other_mode_l & Z_CMP) == Z_CMP) {
+        mRsp->geometry_mode = G_ZBUFFER;
+    }
 
     GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 3, true);
     GfxSpTri1(MAX_VERTICES + 1, MAX_VERTICES + 2, MAX_VERTICES + 3, true);
@@ -4311,7 +4499,7 @@ void Interpreter::GfxDpTextureRectangle(int32_t ulx, int32_t uly, int32_t lrx, i
     // a black square with the circle inside). Matches the same skip in
     // GfxDpFillRectangle ("Don't clear Z buffer here since we already did
     // it with glClear").
-    if (mRdp->color_image_address == mRdp->z_buf_address) {
+    if (RdpColorImageIsZBuffer()) {
         return;
     }
     // printf("render %d at %d\n", tile, lrx);
@@ -4427,22 +4615,42 @@ void Interpreter::GfxDpImageRectangle(int32_t tile, int32_t w, int32_t h, int32_
 }
 
 void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
-    if (mRdp->color_image_address == mRdp->z_buf_address) {
-        // PORT: SSB64's mvOpeningRoom transition Outline issues a full-screen
-        // FillRectangle to ZB right before drawing the visible silhouette tris
-        // with G_RM_AA_OPA_SURF (Z_CMP enabled). On real hardware that fill
-        // rewrites Z to a uniform value so the subsequent tris always pass
-        // depth comparison. Previously we just skipped this entirely under
-        // the assumption that the framebuffer's depth attachment had already
-        // been cleared by a glClear at start-of-frame, but that assumption
-        // doesn't hold mid-frame: the wallpaper drew with G_RM_AA_ZB_OPA_SURF
-        // (Z_UPD set) and filled the depth buffer with its own values, so
-        // Outline tris Z-fail and the transition silhouette never appears.
-        // Treat the redirect-fill as an actual depth clear so the Outline's
-        // subsequent OPA tris have a clean Z buffer to draw against.
-        Flush();
-        mRapi->ClearFramebuffer(false, true);
-        mRenderingState.depth_test_and_mask = 0xff; /* invalidate cached state */
+    if (RdpColorImageIsZBuffer()) {
+        // PORT: color-image-redirect fill — the game is writing a constant
+        // 16-bit value into the Z buffer through the color path (per-camera
+        // depth clears in objdisplay, and the mvOpeningRoom transition
+        // Outline's full-screen Z=near fill). Route it through the normal
+        // rectangle pipeline: the redirect-active tri path already
+        // suppresses framebuffer color writes and synthesizes constant
+        // depth from prim_color (packed 5551, >=0xFFFC snapping to exactly
+        // 1.0), so drawing the rect yields a value- and REGION-accurate
+        // depth fill on every backend with no backend-specific clear hook.
+        //   - G_CYC_FILL: the written value is fill_color's packed RGBA16
+        //     (objdisplay uses GPACK_ZDZ(G_MAXFBZ,0) = 0xFFFC → far) —
+        //     staged into prim_color for the duration of the draw.
+        //   - 1-cycle (Outline): the combiner constant is already
+        //     prim_color ((0,0,0,FF) + XLU blend lands ~0x0001 on hardware
+        //     → near 0).
+        // The region matters: the band cameras clear only their own
+        // viewport strip — a full-buffer clear here mid-frame stomps depth
+        // under the rest of the scene.
+        uint32_t fill_mode = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE));
+        struct RGBA saved_prim = mRdp->prim_color;
+        uint64_t saved_combine = mRdp->combine_mode;
+        if (fill_mode == G_CYC_FILL) {
+            mRdp->prim_color = mRdp->fill_color;
+        }
+        // Match the non-redirect fill flow: FILL/COPY rects are inclusive of
+        // the lower-right pixel, and a known-constant combiner avoids
+        // stale-texture shader selection (color output is masked anyway).
+        if (fill_mode == G_CYC_COPY || fill_mode == G_CYC_FILL) {
+            lrx += 1 << 2;
+            lry += 1 << 2;
+        }
+        GfxDpSetCombineMode(color_comb(0, 0, 0, G_CCMUX_PRIMITIVE), alpha_comb(0, 0, 0, G_ACMUX_PRIMITIVE), 0, 0);
+        GfxDrawRectangle(ulx, uly, lrx, lry);
+        mRdp->combine_mode = saved_combine;
+        mRdp->prim_color = saved_prim;
         return;
     }
     uint32_t mode = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE));
@@ -4476,12 +4684,21 @@ void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
     mRdp->combine_mode = saved_combine_mode;
 }
 
-void Interpreter::GfxDpSetZImage(void* zBufAddr) {
+void Interpreter::GfxDpSetZImage(void* zBufAddr, uint32_t rawAddr) {
     mRdp->z_buf_address = zBufAddr;
+    mRdp->z_buf_address_raw = rawAddr;
 }
 
-void Interpreter::GfxDpSetColorImage(uint32_t format, uint32_t size, uint32_t width, void* address) {
+void Interpreter::GfxDpSetColorImage(uint32_t format, uint32_t size, uint32_t width, void* address, uint32_t rawAddr) {
     mRdp->color_image_address = address;
+    mRdp->color_image_address_raw = rawAddr;
+}
+
+bool Interpreter::RdpColorImageIsZBuffer() const {
+    if (mRdp->color_image_address != nullptr && mRdp->color_image_address == mRdp->z_buf_address) {
+        return true;
+    }
+    return mRdp->color_image_address_raw != 0 && mRdp->color_image_address_raw == mRdp->z_buf_address_raw;
 }
 
 void Interpreter::GfxSpSetOtherMode(uint32_t shift, uint32_t num_bits, uint64_t mode) {
@@ -5202,8 +5419,13 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     // producing a pointer-shaped "opcode" and a cmd-word-shaped "pointer",
     // which then dispatches as garbage G_VTX with bogus vertex addresses.
     {
+        // A native host pointer can coincidentally contain 0x0E in bits
+        // 24..31 (Windows ASLR placed dFTShadowNoPrevLinkDL at
+        // 0x...0EC0D820). Only 32-bit values can be N64 segmented
+        // addresses; applying this rewrite to a 64-bit pointer redirects the
+        // call into unrelated segment-E heap data and starts a runaway walk.
         uint8_t segByte = (uint8_t)((cmd->words.w1 >> 24) & 0xFF);
-        if (segByte == 0x0E) {
+        if (cmd->words.w1 <= UINT32_MAX && segByte == 0x0E) {
             uint32_t segNum = 0x0E;
             uintptr_t segBase = (segNum < MAX_SEGMENT_POINTERS) ? gfx->mSegmentPointers[segNum] : 0;
             if (segBase != 0) {
@@ -5231,7 +5453,7 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
     // DL's containing reloc file (intra-file sub-DL branch).
     {
         uint8_t segByte = (uint8_t)((cmd->words.w1 >> 24) & 0xFF);
-        if (segByte == 0x0E && (uintptr_t)subGFX == cmd->words.w1) {
+        if (cmd->words.w1 <= UINT32_MAX && segByte == 0x0E && (uintptr_t)subGFX == cmd->words.w1) {
             uintptr_t fileBase = 0;
             size_t fileSize = 0;
             if (portRelocFindContainingFile(cmd, &fileBase, &fileSize)) {
@@ -6050,7 +6272,7 @@ bool gfx_set_z_img_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *(cmd0);
 
-    gfx->GfxDpSetZImage(gfx->SegAddr(cmd->words.w1));
+    gfx->GfxDpSetZImage(gfx->SegAddr(cmd->words.w1), (uint32_t)cmd->words.w1);
     return false;
 }
 
@@ -6058,7 +6280,7 @@ bool gfx_set_c_img_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *(cmd0);
 
-    gfx->GfxDpSetColorImage(C0(21, 3), C0(19, 2), C0(0, 11), gfx->SegAddr(cmd->words.w1));
+    gfx->GfxDpSetColorImage(C0(21, 3), C0(19, 2), C0(0, 11), gfx->SegAddr(cmd->words.w1), (uint32_t)cmd->words.w1);
     return false;
 }
 
@@ -6719,6 +6941,17 @@ extern "C" void gfx_set_trace_callback(GbiTraceCallbackFn callback) {
     sGbiTraceCallback = callback;
 }
 
+// Screen coverage (native-resolution pixels) of all triangles processed in
+// the current/most recent Interpreter::Run. Consumed by the port's RCP cost
+// model so fillrate-heavy climax polys register like they do on real
+// hardware. Reset at the start of each Run.
+extern "C" float gfx_get_frame_tri_area_px(void) {
+    if (auto inst = mInstance.lock()) {
+        return inst->mFrameTriAreaPx;
+    }
+    return 0.0f;
+}
+
 void Interpreter::RunGuiOnly() {
     SpReset();
 
@@ -6738,10 +6971,21 @@ void Interpreter::RunGuiOnly() {
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
     // SSB64 port widescreen: when active, the game's 4:3-authored scissor
     // covers only ~93% of the FB width, leaving uncleared side strips that
-    // show prior-frame garbage. Force a color clear in that mode. Outside
-    // widescreen we keep the depth-only clear so the GPU-readback bridge
-    // (port_capture_*) still has prior color contents available.
-    mRapi->ClearFramebuffer(mWidescreenActive, true);
+    // show prior-frame garbage. Clear ONLY those strips: the 4:3 content
+    // area must keep its prior-frame pixels in every mode — N64
+    // framebuffers persist across frames, and SSB64's opening desk→stage
+    // transition deliberately leaves old pixels visible outside its Z mask
+    // (issue #10); a full color clear turns that region black. Depth is
+    // still cleared every frame as before.
+    if (mWidescreenActive && !mWidescreenFramebufferPersistence) {
+        float contentFrac = ((4.0f / 3.0f) * (float)mCurDimensions.height) / (float)mCurDimensions.width;
+        if (contentFrac < 1.0f) {
+            float side = (1.0f - contentFrac) * 0.5f;
+            mRapi->ClearColorRegion(0.0f, 0.0f, side, 1.0f);
+            mRapi->ClearColorRegion(1.0f - side, 0.0f, 1.0f, 1.0f);
+        }
+    }
+    mRapi->ClearFramebuffer(false, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
@@ -6762,6 +7006,7 @@ void Interpreter::RunGuiOnly() {
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
     SpReset();
+    mFrameTriAreaPx = 0.0f;
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
@@ -6777,10 +7022,21 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mRapi->StartDrawToFramebuffer(mRendersToFb ? mGameFb : 0, (float)mCurDimensions.height / mNativeDimensions.height);
     // SSB64 port widescreen: when active, the game's 4:3-authored scissor
     // covers only ~93% of the FB width, leaving uncleared side strips that
-    // show prior-frame garbage. Force a color clear in that mode. Outside
-    // widescreen we keep the depth-only clear so the GPU-readback bridge
-    // (port_capture_*) still has prior color contents available.
-    mRapi->ClearFramebuffer(mWidescreenActive, true);
+    // show prior-frame garbage. Clear ONLY those strips: the 4:3 content
+    // area must keep its prior-frame pixels in every mode — N64
+    // framebuffers persist across frames, and SSB64's opening desk→stage
+    // transition deliberately leaves old pixels visible outside its Z mask
+    // (issue #10); a full color clear turns that region black. Depth is
+    // still cleared every frame as before.
+    if (mWidescreenActive && !mWidescreenFramebufferPersistence) {
+        float contentFrac = ((4.0f / 3.0f) * (float)mCurDimensions.height) / (float)mCurDimensions.width;
+        if (contentFrac < 1.0f) {
+            float side = (1.0f - contentFrac) * 0.5f;
+            mRapi->ClearColorRegion(0.0f, 0.0f, side, 1.0f);
+            mRapi->ClearColorRegion(1.0f - side, 0.0f, 1.0f, 1.0f);
+        }
+    }
+    mRapi->ClearFramebuffer(false, true);
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
@@ -6902,6 +7158,20 @@ void Interpreter::UpdatePostProcessFromCVars() {
 
 void Interpreter::ComposeFinalFrame() {
     mRapi->StartDrawToFramebuffer(0, 1);
+
+    // A display list may legitimately end while its color image is redirected
+    // to the depth buffer. That leaves the backend color-write mask disabled,
+    // but the GUI presentation pass that samples mGameFb is outside the N64
+    // display list and must always be able to write to the swap-chain buffer.
+    // OpenGL exposes the leak directly through its global glColorMask state:
+    // the fighter-name intro cards render correctly into mGameFb, then their
+    // ImGui::Image presentation is discarded and the cleared back buffer stays
+    // black. Restore both the backend state and our cache so the next game draw
+    // can disable writes again when it encounters another redirect.
+    if (!mRenderingState.color_write_enabled) {
+        mRapi->SetColorWriteMask(true);
+        mRenderingState.color_write_enabled = true;
+    }
     mRapi->ClearFramebuffer(true, true);
 
     // The texture-backed FBO whose color attachment the post-process pass
@@ -6957,6 +7227,13 @@ void Interpreter::PresentCurrentFramebuffer() {
                                        false, true, true, !mRendersToFb);
     mRapi->StartFrame();
     mRapi->StartDrawToFramebuffer(0, 1);
+
+    // Held VI frames bypass ComposeFinalFrame(), so independently guarantee
+    // that the cached game texture can be presented after a redirect-ending DL.
+    if (!mRenderingState.color_write_enabled) {
+        mRapi->SetColorWriteMask(true);
+        mRenderingState.color_write_enabled = true;
+    }
     mRapi->ClearFramebuffer(true, false);
 }
 
